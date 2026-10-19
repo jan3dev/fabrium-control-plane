@@ -45,7 +45,7 @@ The database lives in the `data` Docker volume. It survives restarts.
 
 | Variable | Default | Docker value | Notes |
 |----------|---------|--------------|-------|
-| `API_KEYS` | none (required) | from `.env` | Comma-separated `<name>:<sha256-hex>` pairs. The service refuses to start if it is missing, empty, or malformed. |
+| `API_KEYS` | none (required) | from `.env` | Comma-separated `<name>:<sha256-hex>` pairs. The service refuses to start if it is missing, empty, or malformed, or if two entries share a name or a hash. |
 | `BIND_ADDR` | `127.0.0.1:8080` | `0.0.0.0:8080` | Set by the image. |
 | `DATABASE_URL` | `sqlite://data/control-plane.db` | `sqlite:///data/control-plane.db` | Set by the image. The service creates the file and its directory. |
 | `RUST_LOG` | `info` | from `.env` | Log filter. |
@@ -86,4 +86,10 @@ The CLI reads `DATABASE_URL`. There are no migrations yet. Generate entities lat
 
 Send the key in the `Authorization: Bearer <key>` header. The server hashes the key with SHA-256 and compares it with the stored hashes.
 
+The scheme name is case-insensitive. Extra spaces before the key are ignored.
+
 A missing header, a wrong scheme, or an unknown key returns `401` with `WWW-Authenticate: Bearer` and a JSON body such as `{"error":"missing or invalid API key"}`.
+
+Every request has a 10 second limit. A request that runs longer returns `503 Service Unavailable`. `/health` gives the database 2 seconds to answer, so a stalled database returns the JSON `503` above.
+
+The server logs every response at `info` level with the method, path, status, latency, and `x-request-id`.

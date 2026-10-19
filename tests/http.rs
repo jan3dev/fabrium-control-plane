@@ -13,24 +13,31 @@ use tower::ServiceExt;
 // SHA-256 of "secret".
 const HASH: &str = "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b";
 
-async fn app() -> Router {
-    let state = AppState {
+async fn state() -> AppState {
+    AppState {
         db: db::connect("sqlite::memory:").await.unwrap(),
         api_keys: Arc::new(ApiKeys::parse(&format!("zooid:{HASH}")).unwrap()),
-    };
-    build_app(state)
+    }
+}
+
+async fn app() -> Router {
+    build_app(state().await)
 }
 
 async fn get(uri: &str, auth: Option<&str>) -> (StatusCode, Option<String>, Value) {
+    get_from(app().await, uri, auth).await
+}
+
+async fn get_from(
+    app: Router,
+    uri: &str,
+    auth: Option<&str>,
+) -> (StatusCode, Option<String>, Value) {
     let mut req = Request::get(uri);
     if let Some(a) = auth {
         req = req.header(header::AUTHORIZATION, a);
     }
-    let res = app()
-        .await
-        .oneshot(req.body(Body::empty()).unwrap())
-        .await
-        .unwrap();
+    let res = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
     let status = res.status();
     let www = res
         .headers()
@@ -45,6 +52,15 @@ async fn health_is_public() {
     let (status, _, body) = get("/health", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, json!({ "status": "ok" }));
+}
+
+#[tokio::test]
+async fn health_is_503_when_db_is_down() {
+    let state = state().await;
+    state.db.close_by_ref().await.unwrap();
+    let (status, _, body) = get_from(build_app(state), "/health", None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, json!({ "status": "unavailable" }));
 }
 
 #[tokio::test]
@@ -65,13 +81,18 @@ async fn ping_with_bad_key_or_scheme_is_401() {
 }
 
 #[tokio::test]
+async fn bearer_scheme_is_case_insensitive() {
+    for auth in ["bearer secret", "BEARER secret", "Bearer   secret"] {
+        let (status, _, _) = get("/v1/ping", Some(auth)).await;
+        assert_eq!(status, StatusCode::OK, "{auth}");
+    }
+    let (status, _, _) = get("/v1/ping", Some("Bearer ")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn ping_with_valid_key_returns_client() {
     let (status, _, body) = get("/v1/ping", Some("Bearer secret")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, json!({ "pong": true, "client": "zooid" }));
-}
-
-#[test]
-fn malformed_api_keys_fail_to_parse() {
-    assert!(ApiKeys::parse("zooid:nothex").is_err());
 }

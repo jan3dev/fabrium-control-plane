@@ -17,6 +17,8 @@ pub enum ParseError {
     Malformed(String),
     #[error("API_KEYS has a duplicate name {0:?}")]
     Duplicate(String),
+    #[error("API_KEYS entry {0:?} repeats the hash of an earlier entry")]
+    DuplicateKey(String),
 }
 
 #[derive(Debug)]
@@ -35,6 +37,9 @@ impl ApiKeys {
             if keys.iter().any(|(n, _)| n == name) {
                 return Err(ParseError::Duplicate(name.to_owned()));
             }
+            if keys.iter().any(|(_, d)| *d == digest) {
+                return Err(ParseError::DuplicateKey(name.to_owned()));
+            }
             keys.push((name.to_owned(), digest));
         }
         if keys.is_empty() {
@@ -47,6 +52,7 @@ impl ApiKeys {
         let digest = Sha256::digest(key.as_bytes());
         let mut found = None;
         // Visit every entry so the time does not reveal which one matched.
+        // `parse` keeps digests unique, so at most one entry matches.
         for (name, hash) in &self.0 {
             if bool::from(digest.as_slice().ct_eq(hash)) {
                 found = Some(name.as_str());
@@ -61,6 +67,13 @@ pub struct Client {
     pub name: String,
 }
 
+/// Scheme is case-insensitive and whitespace around the token is ignored (RFC 9110).
+fn bearer_token(header: &str) -> Option<&str> {
+    let (scheme, token) = header.split_once(char::is_whitespace)?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
+
 pub async fn require_key(
     State(state): State<AppState>,
     mut req: Request,
@@ -70,7 +83,7 @@ pub async fn require_key(
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(bearer_token)
         .and_then(|key| state.api_keys.find(key))
         .ok_or(AppError::Unauthorized)?
         .to_owned();
@@ -82,13 +95,17 @@ pub async fn require_key(
 mod tests {
     use super::*;
 
+    // SHA-256 of "foo".
     const HASH: &str = "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae";
+    // SHA-256 of "bar".
+    const HASH2: &str = "fcde2b2edba56bf408601fb721fe9b5c338d10ee429ea04fae5511b68fbf8fb9";
 
     #[test]
     fn parses_valid_keys() {
-        let keys = ApiKeys::parse(&format!("zooid:{HASH}, other:{HASH}")).unwrap();
-        assert_eq!(keys.find("foo"), Some("other"));
-        assert_eq!(keys.find("bar"), None);
+        let keys = ApiKeys::parse(&format!("zooid:{HASH}, other:{HASH2}")).unwrap();
+        assert_eq!(keys.find("foo"), Some("zooid"));
+        assert_eq!(keys.find("bar"), Some("other"));
+        assert_eq!(keys.find("baz"), None);
     }
 
     #[test]
@@ -103,10 +120,35 @@ mod tests {
         ] {
             assert!(ApiKeys::parse(bad).is_err(), "{bad:?}");
         }
-        let dup = format!("a:{HASH},a:{HASH}");
+        let dup = format!("a:{HASH},a:{HASH2}");
         assert!(matches!(
             ApiKeys::parse(&dup),
             Err(ParseError::Duplicate(_))
         ));
+    }
+
+    #[test]
+    fn rejects_same_hash_under_two_names() {
+        let dup = format!("a:{HASH},b:{HASH}");
+        assert!(matches!(
+            ApiKeys::parse(&dup),
+            Err(ParseError::DuplicateKey(n)) if n == "b"
+        ));
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        for ok in [
+            "Bearer k",
+            "bearer k",
+            "BEARER k",
+            "Bearer   k",
+            "Bearer \tk ",
+        ] {
+            assert_eq!(bearer_token(ok), Some("k"), "{ok:?}");
+        }
+        for bad in ["Bearer", "Bearer ", "Bearer   ", "Basic k", "k", ""] {
+            assert_eq!(bearer_token(bad), None, "{bad:?}");
+        }
     }
 }
