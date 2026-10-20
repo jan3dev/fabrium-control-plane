@@ -6,7 +6,11 @@ mod http;
 
 use std::{sync::Arc, time::Duration};
 
-use axum::{Router, extract::Request, http::StatusCode};
+use axum::{
+    Router,
+    extract::Request,
+    http::{HeaderName, StatusCode},
+};
 use sea_orm::DatabaseConnection;
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
@@ -17,6 +21,9 @@ use tracing::Level;
 
 /// Upper bound for any request. Answers 503, not 408: 408 invites client retries.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Shared by the layers that set and propagate the id and by the trace span.
+const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
 #[derive(Clone)]
 pub struct AppState {
@@ -34,10 +41,7 @@ pub fn build_app(state: AppState) -> Router {
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|req: &Request| {
-                    let id = req
-                        .headers()
-                        .get("x-request-id")
-                        .and_then(|v| v.to_str().ok());
+                    let id = req.headers().get(REQUEST_ID).and_then(|v| v.to_str().ok());
                     tracing::info_span!(
                         "request",
                         method = %req.method(),
@@ -47,6 +51,6 @@ pub fn build_app(state: AppState) -> Router {
                 })
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
-        .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        .layer(PropagateRequestIdLayer::new(REQUEST_ID))
+        .layer(SetRequestIdLayer::new(REQUEST_ID, MakeRequestUuid))
 }

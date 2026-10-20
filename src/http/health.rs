@@ -10,16 +10,12 @@ const PING_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     match tokio::time::timeout(PING_TIMEOUT, state.db.ping()).await {
-        Ok(Ok(())) => (StatusCode::OK, Json(json!({ "status": "ok" }))),
-        failure => {
-            match failure {
-                Ok(Err(e)) => tracing::error!(error = %e, "health check failed"),
-                _ => tracing::error!("health check timed out"),
-            }
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "status": "unavailable" })),
-            )
-        }
+        Ok(Ok(())) => return (StatusCode::OK, Json(json!({ "status": "ok" }))),
+        Ok(Err(e)) => tracing::error!(error = %e, "health check failed"),
+        Err(_elapsed) => tracing::error!("health check timed out"),
     }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "status": "unavailable" })),
+    )
 }
