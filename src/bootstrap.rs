@@ -128,37 +128,41 @@ impl Store {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Keeps the payload for `ttl`. Also drops the entries that have expired.
-    pub fn insert(&self, token: &str, payload: Payload, instance: &str, tenant: &str, name: &str) {
+    /// The entries, after the ones that have expired are dropped. Every read goes through
+    /// here, so a payload, which holds secrets, does not stay in memory after its time.
+    fn live(&self) -> MutexGuard<'_, HashMap<[u8; 32], Entry>> {
         let now = Instant::now();
         let mut entries = self.entries();
         entries.retain(|_, e| e.expires > now);
+        entries
+    }
+
+    /// Keeps the payload for `ttl`.
+    pub fn insert(&self, token: &str, payload: Payload, instance: &str, tenant: &str, name: &str) {
         let entry = Entry {
             payload,
             instance: instance.to_owned(),
             tenant: tenant.to_owned(),
             name: name.to_owned(),
-            expires: now + self.ttl,
+            expires: Instant::now() + self.ttl,
         };
-        entries.insert(hash(token), entry);
+        self.live().insert(hash(token), entry);
     }
 
     /// Removes the entry. `None` if the token is unknown, used, or expired.
     pub fn redeem(&self, token: &str) -> Option<(Payload, String)> {
-        let entry = self.entries().remove(&hash(token))?;
-        (entry.expires > Instant::now()).then_some((entry.payload, entry.instance))
+        let entry = self.live().remove(&hash(token))?;
+        Some((entry.payload, entry.instance))
     }
 
     /// True if the instance has an entry that has not expired.
     pub fn has_live(&self, instance: &str) -> bool {
-        let now = Instant::now();
-        (self.entries().values()).any(|e| e.instance == instance && e.expires > now)
+        (self.live().values()).any(|e| e.instance == instance)
     }
 
     /// True if a VM of the tenant with this name is still waiting for its token.
     pub fn name_in_use(&self, tenant: &str, name: &str) -> bool {
-        let now = Instant::now();
-        (self.entries().values()).any(|e| e.tenant == tenant && e.name == name && e.expires > now)
+        (self.live().values()).any(|e| e.tenant == tenant && e.name == name)
     }
 
     pub fn remove_instance(&self, instance: &str) {
@@ -274,6 +278,25 @@ mod tests {
         let store = Store::new(Duration::ZERO);
         store.insert("tok", payload(), "i-1", "stage", "lima");
         assert!(!store.name_in_use("stage", "lima"));
+    }
+
+    #[test]
+    fn every_read_drops_the_expired_entries() {
+        // With a zero TTL, an entry is expired the moment it exists. The payload holds
+        // secrets, so it must not stay in memory until the next insert.
+        let store = Store::new(Duration::ZERO);
+        store.insert("a", payload(), "i-1", "stage", "lima");
+        assert_eq!(store.entries().len(), 1);
+        assert!(!store.has_live("i-1"));
+        assert_eq!(store.entries().len(), 0, "has_live");
+
+        store.insert("b", payload(), "i-2", "stage", "other");
+        assert!(store.redeem("unknown").is_none());
+        assert_eq!(store.entries().len(), 0, "redeem of another token");
+
+        store.insert("c", payload(), "i-3", "stage", "third");
+        assert!(!store.name_in_use("stage", "third"));
+        assert_eq!(store.entries().len(), 0, "name_in_use");
     }
 
     #[test]
