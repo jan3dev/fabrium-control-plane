@@ -8,6 +8,7 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use crate::{
     AppState,
@@ -206,13 +207,40 @@ pub async fn create(
     // two requests with one name from both passing the check. Use a lock per tenant and
     // name if creates must run in parallel. With more than one control plane instance it
     // needs a shared lock.
-    let _guard = state.create_lock.lock().await;
+    let guard = state.create_lock.clone().lock_owned().await;
+    let tenant = client.name.clone();
+    let instance_type = instance_type.to_owned();
+    // The request timeout (10 s) drops this handler at its next await. The task is not
+    // dropped with it, so the launch and the insert of the payload stay together. Else a VM
+    // that EC2 accepted could have no payload, and its name would stay in use. The task
+    // keeps the lock until it ends. The SDK timeouts bound that time.
+    let task = tokio::spawn(
+        async move {
+            let _guard = guard;
+            launch_vm(&state, &tenant, request, &instance_type).await
+        }
+        .in_current_span(),
+    );
+    let vm = task
+        .await
+        .map_err(|e| AppError::Aws(format!("create task failed: {e}")))??;
+    Ok((StatusCode::CREATED, Json(vm)))
+}
+
+/// The part of a create that must not be cut in two: the name check, the launch, and the
+/// insert of the payload. The caller holds the create lock.
+async fn launch_vm(
+    state: &AppState,
+    tenant: &str,
+    request: CreateVm,
+    instance_type: &str,
+) -> Result<Vm, AppError> {
     // ponytail: relies on EC2 read-after-write. A describe right after `RunInstances` can
     // miss the new VM, so two creates of one name a moment apart can both pass. Keep the
     // names of recent launches in memory if that ever happens.
-    let taken = (state.ec2.list(&client.name).await?)
+    let taken = (state.ec2.list(tenant).await?)
         .iter()
-        .any(|i| visible(i, &client.name) && i.name == request.name);
+        .any(|i| visible(i, tenant) && i.name == request.name);
     if taken {
         return Err(AppError::Conflict("name in use".to_owned()));
     }
@@ -220,7 +248,7 @@ pub async fn create(
     let token = bootstrap::new_token();
     let launch = Launch {
         name: request.name,
-        tenant: client.name.clone(),
+        tenant: tenant.to_owned(),
         instance_type: instance_type.to_owned(),
         user_data: STANDARD.encode(bootstrap::stub(&state.vm.public_url, &token)),
     };
@@ -229,9 +257,6 @@ pub async fn create(
     state
         .bootstrap
         .insert(&token, request.bootstrap, &instance.id);
-    tracing::info!(tenant = %client.name, vm = %instance.id, %instance_type, "vm launched");
-    Ok((
-        StatusCode::CREATED,
-        Json(Vm::new(&instance, &state.bootstrap)),
-    ))
+    tracing::info!(%tenant, vm = %instance.id, %instance_type, "vm launched");
+    Ok(Vm::new(&instance, &state.bootstrap))
 }

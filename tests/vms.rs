@@ -625,6 +625,40 @@ async fn create_is_502_and_launches_nothing_when_aws_fails() {
 }
 
 #[tokio::test]
+async fn a_create_that_times_out_still_stores_its_payload() {
+    let h = harness().await;
+    // EC2 accepts RunInstances at once and answers 6 s later. The second create waits 6 s
+    // for the lock, then its answer takes 6 s more, so the 10 s request timeout drops it
+    // in the middle of the launch.
+    h.fake.delay_launch(Duration::from_secs(6));
+    tokio::time::pause(); // after the database is up
+    let (a, b) = (create_body("a"), create_body("b"));
+    let (first, second) = tokio::join!(create(&h.app, STAGE, &a), create(&h.app, STAGE, &b));
+    assert_eq!(first.0, StatusCode::CREATED);
+    assert_eq!(
+        second.0,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the premise: the request timed out"
+    );
+    // Let the work that the timeout left behind finish.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    // Every VM that EC2 accepted has its payload. Else the VM would boot with nothing
+    // to redeem, and its name would stay in use.
+    let launched = h.fake.instances();
+    assert_eq!(launched.len(), 2);
+    for instance in &launched {
+        let has_payload = h.state.bootstrap.has_live(&instance.id);
+        assert!(has_payload, "the VM {:?} has no payload", instance.name);
+    }
+    let (_, listed) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
+    let setup: Vec<_> = (listed.as_array().unwrap().iter())
+        .map(|v| (v["name"].as_str().unwrap(), v["setup"].as_str().unwrap()))
+        .collect();
+    assert_eq!(setup, [("a", "pending"), ("b", "pending")]);
+}
+
+#[tokio::test]
 async fn redeem_returns_the_payload_once() {
     let h = harness().await;
     let (_, vm) = create(&h.app, STAGE, &create_body("lima")).await;

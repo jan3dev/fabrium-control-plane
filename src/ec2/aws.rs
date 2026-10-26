@@ -1,9 +1,11 @@
 //! The production `Ec2`, on the AWS SDK. The request and response logic sits in small
 //! functions, so the tests need no network and no credentials.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use aws_config::{BehaviorVersion, Region};
+use aws_config::{BehaviorVersion, Region, timeout::TimeoutConfig};
 use aws_sdk_ec2::{
     Client,
     error::{DisplayErrorContext, ProvideErrorMetadata},
@@ -24,6 +26,16 @@ use crate::config::VmConfig;
 /// The states that the VM list shows. `terminated` is left out on purpose.
 const LISTED_STATES: [&str; 5] = ["pending", "running", "shutting-down", "stopping", "stopped"];
 
+/// No SDK call takes longer than this, retries included. The create task holds the create
+/// lock while it calls AWS, so a call that never answers must not hang for ever.
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn timeouts() -> TimeoutConfig {
+    TimeoutConfig::builder()
+        .operation_timeout(OPERATION_TIMEOUT)
+        .build()
+}
+
 pub struct AwsEc2 {
     client: Client,
     ami_name: String,
@@ -43,6 +55,7 @@ impl AwsEc2 {
             .build_https();
         let config = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(vm.aws_region.clone()))
+            .timeout_config(timeouts())
             .http_client(http)
             .load()
             .await;
@@ -312,7 +325,7 @@ mod tests {
         operation::run_instances::RunInstancesInput,
         types::{InstanceState, InstanceStateName},
     };
-    use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+    use aws_smithy_http_client::test_util::{NeverClient, ReplayEvent, StaticReplayClient};
     use aws_smithy_types::body::SdkBody;
     use axum::http::{Request, Response};
 
@@ -788,6 +801,38 @@ mod tests {
         let body = &sent(&http)[0];
         assert!(has(body, "InstanceType.1=t3a.medium"), "{body}");
         assert!(has(body, "InstanceType.2=t3a.large"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn calls_give_up_when_aws_never_answers() {
+        let client = Client::from_conf(
+            aws_sdk_ec2::Config::builder()
+                .behavior_version(BehaviorVersion::latest())
+                .region(Region::new("us-east-2"))
+                .credentials_provider(Credentials::new(
+                    "AKIDEXAMPLE",
+                    "secret",
+                    None,
+                    None,
+                    "test",
+                ))
+                .http_client(NeverClient::new())
+                .timeout_config(timeouts())
+                .build(),
+        );
+        let ec2 = AwsEc2 {
+            client,
+            ami_name: "ubuntu-test".into(),
+            security_group: "test-sg".into(),
+            key_name: "test-key".into(),
+        };
+        // With the clock paused, minutes pass at once.
+        tokio::time::pause();
+        let outcome = tokio::time::timeout(Duration::from_secs(300), ec2.list("stage")).await;
+        let err = outcome
+            .expect("the SDK must give up by itself")
+            .unwrap_err();
+        assert!(err.to_string().starts_with("DescribeInstances: "), "{err}");
     }
 
     #[tokio::test]

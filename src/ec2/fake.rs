@@ -3,7 +3,10 @@
 //! It is a worst-case port: `list` and `get` return every instance of every tenant
 //! and state, so a test that passes proves that the handlers do the filtering.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::{
+    sync::{Mutex, MutexGuard, PoisonError},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
@@ -49,6 +52,7 @@ struct Inner {
     fail_writes: bool,
     fail_tagging: bool,
     hang_tagging: bool,
+    launch_delay: Duration,
 }
 
 impl FakeEc2 {
@@ -67,6 +71,11 @@ impl FakeEc2 {
 
     pub fn instance(&self, id: &str) -> Option<Instance> {
         self.inner().instances.iter().find(|i| i.id == id).cloned()
+    }
+
+    /// Every instance that EC2 holds, seeded or launched.
+    pub fn instances(&self) -> Vec<Instance> {
+        self.inner().instances.clone()
     }
 
     pub fn launches(&self) -> Vec<Launch> {
@@ -101,6 +110,12 @@ impl FakeEc2 {
     pub fn hang_tagging(&self, on: bool) {
         self.inner().hang_tagging = on;
     }
+
+    /// `launch` holds the VM at once, as EC2 does when it accepts `RunInstances`, and
+    /// answers after `delay`. A caller that gives up in between still has a launched VM.
+    pub fn delay_launch(&self, delay: Duration) {
+        self.inner().launch_delay = delay;
+    }
 }
 
 // No lock guard lives across an await: the futures must be `Send`.
@@ -134,19 +149,25 @@ impl Ec2 for FakeEc2 {
     async fn launch(&self, launch: &Launch) -> Result<Instance> {
         tokio::task::yield_now().await;
         self.check()?;
-        let mut inner = self.inner();
-        ensure!(!inner.fail_writes, "fake EC2 write failure");
-        // 17 hex digits, like EC2. The `fa` prefix keeps these apart from seeded ids.
-        let id = format!("i-fa{:015x}", inner.launches.len() + 1);
-        let launched = instance(
-            &id,
-            &launch.name,
-            Some(&launch.tenant),
-            "pending",
-            &launch.instance_type,
-        );
-        inner.instances.push(launched.clone());
-        inner.launches.push(launch.clone());
+        let (launched, delay) = {
+            let mut inner = self.inner();
+            ensure!(!inner.fail_writes, "fake EC2 write failure");
+            // 17 hex digits, like EC2. The `fa` prefix keeps these apart from seeded ids.
+            let id = format!("i-fa{:015x}", inner.launches.len() + 1);
+            let launched = instance(
+                &id,
+                &launch.name,
+                Some(&launch.tenant),
+                "pending",
+                &launch.instance_type,
+            );
+            inner.instances.push(launched.clone());
+            inner.launches.push(launch.clone());
+            (launched, inner.launch_delay)
+        };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         Ok(launched)
     }
 
@@ -275,6 +296,22 @@ mod tests {
         let hung = tokio::time::timeout(std::time::Duration::from_secs(60), tagging).await;
         assert!(hung.is_err());
         assert!(!fake.instance(&i.id).unwrap().setup_delivered);
+    }
+
+    #[tokio::test]
+    async fn launch_can_be_accepted_at_once_and_answer_late() {
+        let fake = FakeEc2::default();
+        fake.delay_launch(Duration::from_secs(6));
+        tokio::time::pause();
+        let a = launch("a");
+        let gave_up = tokio::time::timeout(Duration::from_secs(1), fake.launch(&a)).await;
+        // The caller gave up, but EC2 had accepted the launch.
+        assert!(gave_up.is_err());
+        let seen: Vec<_> = fake.instances().into_iter().map(|i| i.name).collect();
+        assert_eq!(seen, ["a"]);
+        // Without the delay, the same call answers.
+        fake.delay_launch(Duration::ZERO);
+        assert!(fake.launch(&launch("b")).await.is_ok());
     }
 
     #[tokio::test]
