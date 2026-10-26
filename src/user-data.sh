@@ -6,6 +6,8 @@ umask 077
 URL='<PUBLIC_URL>/v1/bootstrap'
 TOKEN='<TOKEN>'
 PAYLOAD=/run/fabrium-bootstrap.json
+# The payload and the setup script hold secrets. Whatever happens, they do not stay in /run.
+trap 'rm -f "$PAYLOAD" /run/fabrium-setup.sh' EXIT
 
 deadline=$((SECONDS + 600))
 while [ "$SECONDS" -lt "$deadline" ]; do
@@ -27,10 +29,10 @@ for i in $(seq 0 $((count - 1))); do
     sudo -u "$owner" mkdir -p -m 700 "$(dirname "$path")"
   fi
   jq -j ".files[$i].content" "$PAYLOAD" >"$path"
-  chmod "$(jq -r ".files[$i].mode" "$PAYLOAD")" "$path"
+  # chown clears the setuid and setgid bits, so the mode comes last.
   chown "$owner:" "$path"
+  chmod "$(jq -r ".files[$i].mode" "$PAYLOAD")" "$path"
 done
 
 jq -r '.script' "$PAYLOAD" >/run/fabrium-setup.sh
 bash /run/fabrium-setup.sh
-rm -f "$PAYLOAD" /run/fabrium-setup.sh
