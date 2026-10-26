@@ -121,7 +121,7 @@ An `{id}` that is not of the form `^i-[0-9a-f]{8,17}$`, a VM of another tenant, 
 | `GET /_fabrium/v1/access` | `200 {"user_id":"@ann:example.org","role":"admin"}` | `role` is `admin` or `owner`. The web shows the VM rail button only after a `200`. |
 | `GET /_fabrium/v1/vms` | `200 [vm & {"agent_id": string or null}]` | `agent_id` comes from the bundle `workstations/<name>/`. `null` if there is no bundle. |
 | `GET /_fabrium/v1/instance-types` | `200 [type]` | Proxy. |
-| `GET /_fabrium/v1/agents` | `200 [{"workstation":"lima","agent_id":"@lima.echo:example.org","preset":"opencode","free":true}]` | Every bundle, sorted by `workstation`. `free` is true if `preset` is `opencode` and no VM in the list has that name. |
+| `GET /_fabrium/v1/agents` | `200 [{"workstation":"lima","agent_id":"@lima.echo:example.org","preset":"opencode","free":true}]` | Every bundle, sorted by `workstation`. `free` is true if `preset` is `opencode`, no VM in the list has that name, and, for a bundle that the VM API made, its admission finished: its token works, and the agent is joined to the workforce space and listed in its roster entry. |
 | `POST /_fabrium/v1/vms` | `201 vm & {"agent_id": string}` | Body below. |
 | `POST /_fabrium/v1/vms/:id/start`, `/stop`, `/reboot` | `202 vm` | Proxy. |
 | `DELETE /_fabrium/v1/vms/:id` | `202`, empty body | Proxy. |
