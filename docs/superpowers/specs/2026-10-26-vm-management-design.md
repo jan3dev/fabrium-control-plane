@@ -263,7 +263,7 @@ The control plane keeps its request timeout of 10 seconds. EC2 calls return in s
 
 ## Security notes
 
-- The bootstrap token stays in the user data until the VM redeems it, 15 minutes or less. A PowerUser can read it there. Because the token works once, a theft is visible: the real VM then shows `expired`.
+- The bootstrap token stays in the user data until the VM redeems it, 15 minutes or less. A PowerUser can read it there. Because the token works once, a theft is visible: the redeem of the real VM gets `404`, its agent never comes online, and `/var/log/fabrium-bootstrap.log` on the VM shows the failure. The list shows `delivered`, because the redeem of the thief set the tag.
 - v1 does not protect against insiders of the AWS account. A PowerUser can also make a snapshot of a disk.
 - Secrets on the VM: `~/zooid/.env` (the AS token of the VM) and `~/zooid/secrets.env` (Haven and GitHub), mode 600. The agent can read them. "Security" in `deploy/README.md` accepts this.
 - Types without SEV-SNP are allowed, and the UI marks them. `fabrium/docs/tech/create-vm-from-image.md` advises against secrets on them.
