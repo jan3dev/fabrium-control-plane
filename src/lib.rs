@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod ec2;
 pub mod error;
 mod http;
 
