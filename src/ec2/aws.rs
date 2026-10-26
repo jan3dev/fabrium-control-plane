@@ -23,6 +23,10 @@ use aws_smithy_http_client::{Builder, tls};
 use super::{Action, Ec2, Instance, Launch, TypeSpec, sev_snp};
 use crate::config::VmConfig;
 
+/// The value of the `Project` tag on every VM, volume, and image of this service. The IAM
+/// policy lets `RunInstances` use only images that carry it.
+const PROJECT: &str = "jan3-dev-env";
+
 /// The states that the VM list shows. `terminated` is left out on purpose.
 const LISTED_STATES: [&str; 5] = ["pending", "running", "shutting-down", "stopping", "stopped"];
 
@@ -130,7 +134,7 @@ fn run_instances(
         TagSpecification::builder()
             .resource_type(resource)
             .tags(tag("Name", &launch.name))
-            .tags(tag("Project", "jan3-dev-env"))
+            .tags(tag("Project", PROJECT))
             .tags(tag("fabrium:tenant", &launch.tenant))
             .build()
     };
@@ -244,11 +248,16 @@ impl Ec2 for AwsEc2 {
             .owners("self")
             .filters(filter("name", &[&self.ami_name]))
             .filters(filter("state", &["available"]))
+            .filters(filter("tag:Project", &[PROJECT]))
             .send()
             .await
             .map_err(aws_err("DescribeImages"))?;
-        let image = newest_image(images.images())
-            .with_context(|| format!("no available image named {:?}", self.ami_name))?;
+        let image = newest_image(images.images()).with_context(|| {
+            format!(
+                "no available image named {:?} with the tag Project={PROJECT}",
+                self.ami_name
+            )
+        })?;
         let image_id = image.image_id().context("image without an id")?;
         let root_device = image
             .root_device_name()
@@ -686,6 +695,9 @@ mod tests {
             "Filter.1.Value.1=ubuntu-test",
             "Filter.2.Name=state",
             "Filter.2.Value.1=available",
+            // The IAM policy lets RunInstances use only images with this tag.
+            "Filter.3.Name=tag%3AProject",
+            "Filter.3.Value.1=jan3-dev-env",
         ];
         for want in wants {
             assert!(has(images, want), "{want}: {images}");

@@ -59,7 +59,7 @@ The database lives in the `data` Docker volume. It survives restarts.
 | `PUBLIC_URL` | none (required) | from `.env` | The base URL that VMs use to redeem their token. It must start with `https://` and must not hold a quote or a space. The service removes a trailing `/`. |
 | `AWS_REGION` | `us-east-2` | from `.env` | |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | none | from `.env` | The AWS SDK reads them from the environment. Temporary credentials expire. Put new ones in `.env` and recreate the container. |
-| `AMI_NAME` | `ubuntu-24.04-jan3-dev-env-v3` | from `.env` | The VM image. The service uses the newest available image that the account owns with this name. |
+| `AMI_NAME` | `ubuntu-24.04-jan3-dev-env-v3` | from `.env` | The VM image. The service uses the newest available image that the account owns with this name and with the tag `Project=jan3-dev-env`. |
 | `INSTANCE_TYPES` | `t3a.medium,t3a.large,t3.medium,t3.large,m6a.large,c6a.large,r6a.large` | from `.env` | The allowlist, in the order that the API shows it. Each entry is `<family>.<size>`. The family is `t3`, `t3a`, `c6a`, `m6a`, or `r6a`. The service refuses to start with another family or with a duplicate. |
 | `DEFAULT_INSTANCE_TYPE` | `t3a.medium` | from `.env` | Must be in `INSTANCE_TYPES`. |
 | `SECURITY_GROUP` | `jan3-dev-env-ssh` | from `.env` | The security group of new VMs, by name. |
@@ -197,6 +197,12 @@ A restart of the service loses the payloads that no VM redeemed yet. Those VMs s
 Logs never contain tokens, payloads, or file contents.
 
 ## Deploy on the control host
+
+The AWS account needs these resources before the first create. The service looks them up by name at each launch.
+
+- An image named `AMI_NAME` that the account owns, with the tag `Project=jan3-dev-env`. Without the tag the service does not find the image, and the IAM policy would refuse it anyway.
+- The security group `SECURITY_GROUP` and the key pair `KEY_NAME`.
+- An IAM identity with the policy of [IAM](#iam).
 
 The host runs Docker Compose with Caddy in front of the service. Caddy gets the TLS certificate. For tests, use the host name `<ip-with-dashes>.sslip.io`. Open the ports 80 and 443 in the firewall.
 
