@@ -54,8 +54,13 @@ impl Payload {
     }
 }
 
+/// An absolute path to a file: no trailing `/`, no control character (the stub would drop a
+/// NUL byte and read a newline as the end of the path), and no `..` segment.
 fn valid_path(path: &str) -> bool {
-    path.starts_with('/') && !path.split('/').any(|segment| segment == "..")
+    path.starts_with('/')
+        && !path.ends_with('/')
+        && !path.chars().any(char::is_control)
+        && !path.split('/').any(|segment| segment == "..")
 }
 
 /// `^[0-7]{3,4}$`
@@ -297,13 +302,30 @@ mod tests {
             ..payload()
         };
         assert!(no_files.validate().is_ok());
-        for path in ["/a", "/a/b.c", "/a/..b/c", "/"] {
+        for path in ["/a", "/a/b.c", "/a/..b/c", "/a b", "/ä/日本"] {
             assert!(
                 with_file(file(path, "600", "ubuntu")).validate().is_ok(),
                 "{path}"
             );
         }
-        for path in ["home/x", "", "/a/../b", "/..", "../a"] {
+        let bad_paths = [
+            "home/x",
+            "",
+            "/a/../b",
+            "/..",
+            "../a",
+            // A path names a file: no trailing slash.
+            "/",
+            "/a/",
+            // No control character, so no NUL, newline, or tab.
+            "/a\n",
+            "/a\r",
+            "/a\0b",
+            "/a\tb",
+            "/a\u{7f}",
+            "/\u{0}../etc/x",
+        ];
+        for path in bad_paths {
             assert!(
                 with_file(file(path, "600", "ubuntu")).validate().is_err(),
                 "{path:?}"

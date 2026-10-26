@@ -456,7 +456,15 @@ async fn create_rejects_invalid_input_with_400() {
             with(|b| b["instance_type"] = json!(t)),
         ));
     }
-    for path in ["home/x", "", "/a/../b", "/.."] {
+    for path in [
+        "home/x",
+        "",
+        "/a/../b",
+        "/..",
+        "/etc/trailing/",
+        "/etc/a\nb",
+        "/\u{0}../etc/x",
+    ] {
         let edit = |b: &mut Value| b["bootstrap"]["files"][0]["path"] = json!(path);
         cases.push((format!("path {path:?}"), with(edit)));
     }

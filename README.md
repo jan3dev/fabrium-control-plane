@@ -163,7 +163,7 @@ An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and 
 |-------|-------------------|
 | `name` | `^[a-z0-9][a-z0-9-]{0,62}$` |
 | `instance_type` | Optional. In `INSTANCE_TYPES`. The default is `DEFAULT_INSTANCE_TYPE`. |
-| `files[].path` | Starts with `/`. No `..` segment. |
+| `files[].path` | Starts with `/` and does not end with `/`. No `..` segment. No control character, such as a newline or a NUL byte. |
 | `files[].mode` | `^[0-7]{3,4}$` |
 | `files[].owner` | `^[a-z_][a-z0-9_-]{0,31}$` |
 | `files[].content` | A string. |
