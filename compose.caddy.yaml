@@ -1,0 +1,25 @@
+# Puts Caddy in front of the control plane. Caddy gets the TLS certificate.
+#
+#   docker compose -f compose.yaml -f compose.caddy.yaml up -d --build
+#
+# `.env` must set CP_HOST, the host name that Caddy serves. Caddy does not read the rest
+# of `.env`, so the AWS keys stay out of its container.
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - control-plane
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CP_HOST: ${CP_HOST:?set CP_HOST in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
