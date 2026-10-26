@@ -77,7 +77,7 @@ pub struct Client {
 }
 
 /// Scheme is case-insensitive and whitespace around the token is ignored (RFC 9110).
-fn bearer_token(header: &str) -> Option<&str> {
+pub(crate) fn bearer_token(header: &str) -> Option<&str> {
     let (scheme, token) = header.split_once(char::is_whitespace)?;
     let token = token.trim();
     (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)

@@ -48,6 +48,7 @@ struct Inner {
     fail: bool,
     fail_writes: bool,
     fail_tagging: bool,
+    hang_tagging: bool,
 }
 
 impl FakeEc2 {
@@ -94,6 +95,11 @@ impl FakeEc2 {
     /// While on, `mark_setup_delivered` returns an error.
     pub fn fail_tagging(&self, on: bool) {
         self.inner().fail_tagging = on;
+    }
+
+    /// While on, `mark_setup_delivered` never finishes.
+    pub fn hang_tagging(&self, on: bool) {
+        self.inner().hang_tagging = on;
     }
 }
 
@@ -157,6 +163,10 @@ impl Ec2 for FakeEc2 {
 
     async fn mark_setup_delivered(&self, id: &str) -> Result<()> {
         self.check()?;
+        let hang = self.inner().hang_tagging;
+        if hang {
+            std::future::pending::<()>().await;
+        }
         let mut inner = self.inner();
         ensure!(!inner.fail_tagging, "fake EC2 tagging failure");
         let found = (inner.instances.iter_mut().find(|i| i.id == id))
@@ -253,6 +263,18 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fake.type_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn tagging_can_hang() {
+        let fake = FakeEc2::default();
+        let i = fake.launch(&launch("a")).await.unwrap();
+        fake.hang_tagging(true);
+        tokio::time::pause();
+        let tagging = fake.mark_setup_delivered(&i.id);
+        let hung = tokio::time::timeout(std::time::Duration::from_secs(60), tagging).await;
+        assert!(hung.is_err());
+        assert!(!fake.instance(&i.id).unwrap().setup_delivered);
     }
 
     #[tokio::test]

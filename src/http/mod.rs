@@ -1,5 +1,6 @@
 mod health;
 mod ping;
+mod redeem;
 mod vms;
 
 use axum::{
@@ -29,6 +30,7 @@ pub fn router(state: AppState) -> Router {
         ));
     Router::new()
         .route("/health", get(health::health))
+        .route("/v1/bootstrap", post(redeem::redeem))
         .merge(protected)
         .with_state(state)
 }

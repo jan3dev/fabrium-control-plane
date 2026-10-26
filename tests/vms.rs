@@ -1,101 +1,17 @@
-use std::sync::Arc;
+mod common;
 
-use axum::{
-    Router,
-    body::Body,
-    http::{Request, StatusCode, header},
-};
+use std::{sync::Arc, time::Duration};
+
+use axum::http::StatusCode;
 use base64::{Engine, engine::general_purpose::STANDARD};
+use common::*;
 use fabrium_control_plane::{
-    AppState,
-    bootstrap::Payload,
-    build_app,
-    config::Config,
-    db,
-    ec2::{Action, FakeEc2, Instance, fake},
+    bootstrap::Store,
+    ec2::{Action, Instance, fake},
 };
-use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use tower::ServiceExt;
 
 // SHA-256 of "stage-secret" and of "prod-secret". The tenants are `stage` and `prod-sim`.
-const STAGE_HASH: &str = "6007fed9aaab6d871e6d973f04c07424f0e7799e33ac7f65fa5b1f29bdb34ffb";
-const PROD_HASH: &str = "e2d097e6ec0d559bc076f6e49643bee69a8bd5ae0333158434cdd58abd263c60";
-const STAGE: &str = "Bearer stage-secret";
-const PROD: &str = "Bearer prod-secret";
-
-struct Harness {
-    app: Router,
-    fake: Arc<FakeEc2>,
-    state: AppState,
-}
-
-async fn harness() -> Harness {
-    let config = Config::from_lookup(|k| match k {
-        "API_KEYS" => Some(format!("stage:{STAGE_HASH},prod-sim:{PROD_HASH}")),
-        "PUBLIC_URL" => Some("https://cp.example.org".to_owned()),
-        _ => None,
-    })
-    .unwrap();
-    let fake = Arc::new(FakeEc2::default());
-    let state = AppState::new(
-        db::connect("sqlite::memory:").await.unwrap(),
-        config.api_keys,
-        config.vm,
-        fake.clone(),
-    );
-    Harness {
-        app: build_app(state.clone()),
-        fake,
-        state,
-    }
-}
-
-/// The status and the raw body of a request with a body.
-async fn send(
-    app: &Router,
-    method: &str,
-    uri: &str,
-    auth: Option<&str>,
-    body: Vec<u8>,
-) -> (StatusCode, Vec<u8>) {
-    let mut req = Request::builder().method(method).uri(uri);
-    if let Some(auth) = auth {
-        req = req.header(header::AUTHORIZATION, auth);
-    }
-    let res = app
-        .clone()
-        .oneshot(req.body(Body::from(body)).unwrap())
-        .await
-        .unwrap();
-    let status = res.status();
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    (status, bytes.to_vec())
-}
-
-/// The status and the raw body of a request without a body.
-async fn call_raw(
-    app: &Router,
-    method: &str,
-    uri: &str,
-    auth: Option<&str>,
-) -> (StatusCode, Vec<u8>) {
-    send(app, method, uri, auth, Vec::new()).await
-}
-
-/// The status and the JSON body. The body is `Null` if it is empty or not JSON.
-async fn call(app: &Router, method: &str, uri: &str, auth: Option<&str>) -> (StatusCode, Value) {
-    let (status, bytes) = call_raw(app, method, uri, auth).await;
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
-}
-
-fn aws_failed() -> Value {
-    json!({ "error": "aws request failed" })
-}
-
 #[tokio::test]
 async fn instance_types_follow_config_order() {
     let h = harness().await;
@@ -156,42 +72,6 @@ async fn vm_routes_need_a_tenant_key() {
             assert!(body["error"].is_string());
         }
     }
-}
-
-fn empty_payload() -> Payload {
-    Payload {
-        files: vec![],
-        script: "true".to_owned(),
-    }
-}
-
-/// A valid create request.
-fn create_body(name: &str) -> Value {
-    json!({
-        "name": name,
-        "bootstrap": {
-            "files": [{
-                "path": "/home/ubuntu/zooid/.env", "mode": "600", "owner": "ubuntu",
-                "content": "SECRET=1\n"
-            }],
-            "script": "#!/bin/bash\ntrue\n"
-        }
-    })
-}
-
-/// The status and the JSON body of `POST /v1/vms`.
-async fn create(app: &Router, auth: &str, body: &Value) -> (StatusCode, Value) {
-    let bytes = serde_json::to_vec(body).unwrap();
-    let (status, bytes) = send(app, "POST", "/v1/vms", Some(auth), bytes).await;
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
-}
-
-/// An instance of tenant `stage` with a known launch time.
-fn stage_vm(id: &str, name: &str, state: &str, instance_type: &str) -> Instance {
-    fake::instance(id, name, Some("stage"), state, instance_type)
 }
 
 #[tokio::test]
@@ -273,13 +153,9 @@ async fn setup_comes_from_the_tag_then_the_store_then_expiry() {
         "running",
         "t3a.medium",
     ));
-    let payload = Payload {
-        files: vec![],
-        script: "true".to_owned(),
-    };
     h.state
         .bootstrap
-        .insert("token", payload, "i-0000000000000002");
+        .insert("token", empty_payload(), "i-0000000000000002");
 
     let (_, body) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
     let setup: Vec<_> = body
@@ -716,10 +592,8 @@ async fn user_data_holds_the_stub_and_the_store_holds_the_payload() {
     let script = String::from_utf8(STANDARD.decode(user_data).unwrap()).unwrap();
     assert!(script.starts_with("#!/bin/bash\n"));
     assert!(script.contains("\nURL='https://cp.example.org/v1/bootstrap'\n"));
-    let token = (script.lines())
-        .find_map(|l| l.strip_prefix("TOKEN='")?.strip_suffix('\''))
-        .expect("a TOKEN= line");
-    let (payload, instance) = h.state.bootstrap.redeem(token).expect("the token redeems");
+    let token = token_in(user_data);
+    let (payload, instance) = h.state.bootstrap.redeem(&token).expect("the token redeems");
     assert_eq!(vm["id"], json!(instance));
     assert_eq!(
         serde_json::to_value(&payload).unwrap(),
@@ -748,4 +622,171 @@ async fn create_is_502_and_launches_nothing_when_aws_fails() {
         let (status, _) = create(&h.app, STAGE, &create_body("lima")).await;
         assert_eq!(status, StatusCode::CREATED, "{mode}");
     }
+}
+
+#[tokio::test]
+async fn redeem_returns_the_payload_once() {
+    let h = harness().await;
+    let (_, vm) = create(&h.app, STAGE, &create_body("lima")).await;
+    let token = token_in(&h.fake.launches()[0].user_data);
+
+    let (status, body) = redeem(&h, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, create_body("lima")["bootstrap"]);
+    assert!(
+        h.fake
+            .instance(vm["id"].as_str().unwrap())
+            .unwrap()
+            .setup_delivered
+    );
+    let (_, listed) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
+    assert_eq!(listed[0]["setup"], "delivered");
+
+    let (status, body) = redeem(&h, &token).await;
+    assert_eq!((status, body), (StatusCode::NOT_FOUND, not_found()));
+}
+
+#[tokio::test]
+async fn redeem_rejects_missing_unknown_and_expired_tokens() {
+    let h = harness().await;
+    create(&h.app, STAGE, &create_body("lima")).await;
+    for auth in [
+        None,
+        Some("Basic abc"),
+        Some("Bearer nope"),
+        Some("Bearer "),
+        Some("abc"),
+    ] {
+        let (status, body) = call(&h.app, "POST", "/v1/bootstrap", auth).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::NOT_FOUND, not_found()),
+            "{auth:?}"
+        );
+    }
+    // The wrong guesses did not burn the real token.
+    let token = token_in(&h.fake.launches()[0].user_data);
+    assert_eq!(redeem(&h, &token).await.0, StatusCode::OK);
+
+    // A token that nobody redeems in time.
+    let h = harness_with(|s| s.bootstrap = Arc::new(Store::new(Duration::ZERO))).await;
+    create(&h.app, STAGE, &create_body("lima")).await;
+    let token = token_in(&h.fake.launches()[0].user_data);
+    let (status, body) = redeem(&h, &token).await;
+    assert_eq!((status, body), (StatusCode::NOT_FOUND, not_found()));
+    let (_, listed) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
+    assert_eq!(listed[0]["setup"], "expired");
+}
+
+#[tokio::test]
+async fn keys_and_tokens_do_not_cross() {
+    let h = harness().await;
+    create(&h.app, STAGE, &create_body("lima")).await;
+    let token = token_in(&h.fake.launches()[0].user_data);
+    // A tenant key is not a bootstrap token.
+    let (status, body) = call(&h.app, "POST", "/v1/bootstrap", Some(STAGE)).await;
+    assert_eq!((status, body), (StatusCode::NOT_FOUND, not_found()));
+    // A bootstrap token is not a tenant key.
+    let auth = format!("Bearer {token}");
+    for uri in ["/v1/vms", "/v1/instance-types"] {
+        let (status, _) = call(&h.app, "GET", uri, Some(&auth)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+    }
+    let (status, _) = call(&h.app, "DELETE", "/v1/vms/i-fa000000000000001", Some(&auth)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Neither mix-up used the token up.
+    assert_eq!(redeem(&h, &token).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn payload_round_trips_awkward_content() {
+    let h = harness().await;
+    let contents = [
+        "it's \"quoted\"",
+        "back\\slash $HOME `cmd` $(cmd) ${x}",
+        "line1\nline2\n",
+        "crlf\r\nline\r\n",
+        "héllo wörld, 日本語, 🙂",
+        "",
+        "trailing space ",
+        "\ttab",
+        "'; rm -rf / #",
+        "<TOKEN> and <PUBLIC_URL>",
+        "no newline at the end",
+    ];
+    for (i, content) in contents.iter().enumerate() {
+        let mut body = create_body(&format!("vm-{i}"));
+        body["bootstrap"]["files"][0]["content"] = json!(content);
+        body["bootstrap"]["script"] = json!(format!("#!/bin/bash\necho '{content}'\n"));
+        let (status, _) = create(&h.app, STAGE, &body).await;
+        assert_eq!(status, StatusCode::CREATED, "{content:?}");
+        let token = token_in(&h.fake.launches()[i].user_data);
+        let (status, got) = redeem(&h, &token).await;
+        assert_eq!(status, StatusCode::OK, "{content:?}");
+        assert_eq!(got, body["bootstrap"], "{content:?}");
+    }
+    // No files at all, and several files with different owners and modes.
+    let mut body = create_body("none");
+    body["bootstrap"]["files"] = json!([]);
+    create(&h.app, STAGE, &body).await;
+    let token = token_in(&h.fake.launches()[contents.len()].user_data);
+    assert_eq!(redeem(&h, &token).await.1, body["bootstrap"]);
+
+    let files = json!([
+        { "path": "/etc/a", "mode": "644", "owner": "root", "content": "a" },
+        { "path": "/home/ubuntu/b", "mode": "0600", "owner": "ubuntu", "content": "b" },
+    ]);
+    let mut body = create_body("many");
+    body["bootstrap"]["files"] = files;
+    create(&h.app, STAGE, &body).await;
+    let token = token_in(&h.fake.launches()[contents.len() + 1].user_data);
+    assert_eq!(redeem(&h, &token).await.1, body["bootstrap"]);
+}
+
+#[tokio::test]
+async fn redeem_still_delivers_when_tagging_fails() {
+    let h = harness().await;
+    let (_, vm) = create(&h.app, STAGE, &create_body("lima")).await;
+    let token = token_in(&h.fake.launches()[0].user_data);
+    h.fake.fail_tagging(true);
+    let (status, body) = redeem(&h, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, create_body("lima")["bootstrap"]);
+    // The token is used up all the same, and the VM is not marked.
+    assert_eq!(redeem(&h, &token).await.0, StatusCode::NOT_FOUND);
+    assert!(
+        !h.fake
+            .instance(vm["id"].as_str().unwrap())
+            .unwrap()
+            .setup_delivered
+    );
+}
+
+#[tokio::test]
+async fn redeem_still_delivers_when_tagging_hangs() {
+    let h = harness().await;
+    create(&h.app, STAGE, &create_body("lima")).await;
+    let token = token_in(&h.fake.launches()[0].user_data);
+    h.fake.hang_tagging(true);
+    // With the clock paused, a wait of 5 s takes no time. The outer limit makes a
+    // handler that waits for ever fail the test instead of hanging it.
+    tokio::time::pause();
+    let redeemed = tokio::time::timeout(Duration::from_secs(30), redeem(&h, &token)).await;
+    let (status, body) = redeemed.expect("the redeem must not wait for the tag");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, create_body("lima")["bootstrap"]);
+}
+
+#[tokio::test]
+async fn delete_before_redeem_drops_the_token() {
+    let h = harness().await;
+    let (_, vm) = create(&h.app, STAGE, &create_body("lima")).await;
+    let token = token_in(&h.fake.launches()[0].user_data);
+    let uri = format!("/v1/vms/{}", vm["id"].as_str().unwrap());
+    assert_eq!(
+        call_raw(&h.app, "DELETE", &uri, Some(STAGE)).await.0,
+        StatusCode::ACCEPTED
+    );
+    let (status, body) = redeem(&h, &token).await;
+    assert_eq!((status, body), (StatusCode::NOT_FOUND, not_found()));
 }
