@@ -14,7 +14,7 @@ use axum::{
     http::{HeaderName, StatusCode},
 };
 use sea_orm::DatabaseConnection;
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     timeout::TimeoutLayer,
@@ -37,6 +37,8 @@ pub struct AppState {
     pub bootstrap: Arc<bootstrap::Store>,
     /// vCPUs and memory of the allowed instance types, cached after the first success.
     pub types: Arc<OnceCell<Vec<ec2::TypeSpec>>>,
+    /// Held by `POST /v1/vms` from the name check to the launch.
+    pub create_lock: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -53,6 +55,7 @@ impl AppState {
             ec2,
             bootstrap: Arc::new(bootstrap::Store::new(bootstrap::TTL)),
             types: Arc::default(),
+            create_lock: Arc::default(),
         }
     }
 }

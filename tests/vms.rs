@@ -5,6 +5,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use fabrium_control_plane::{
     AppState,
     bootstrap::Payload,
@@ -50,12 +51,13 @@ async fn harness() -> Harness {
     }
 }
 
-/// The status and the raw body.
-async fn call_raw(
+/// The status and the raw body of a request with a body.
+async fn send(
     app: &Router,
     method: &str,
     uri: &str,
     auth: Option<&str>,
+    body: Vec<u8>,
 ) -> (StatusCode, Vec<u8>) {
     let mut req = Request::builder().method(method).uri(uri);
     if let Some(auth) = auth {
@@ -63,12 +65,22 @@ async fn call_raw(
     }
     let res = app
         .clone()
-        .oneshot(req.body(Body::empty()).unwrap())
+        .oneshot(req.body(Body::from(body)).unwrap())
         .await
         .unwrap();
     let status = res.status();
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     (status, bytes.to_vec())
+}
+
+/// The status and the raw body of a request without a body.
+async fn call_raw(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    auth: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
+    send(app, method, uri, auth, Vec::new()).await
 }
 
 /// The status and the JSON body. The body is `Null` if it is empty or not JSON.
@@ -151,6 +163,30 @@ fn empty_payload() -> Payload {
         files: vec![],
         script: "true".to_owned(),
     }
+}
+
+/// A valid create request.
+fn create_body(name: &str) -> Value {
+    json!({
+        "name": name,
+        "bootstrap": {
+            "files": [{
+                "path": "/home/ubuntu/zooid/.env", "mode": "600", "owner": "ubuntu",
+                "content": "SECRET=1\n"
+            }],
+            "script": "#!/bin/bash\ntrue\n"
+        }
+    })
+}
+
+/// The status and the JSON body of `POST /v1/vms`.
+async fn create(app: &Router, auth: &str, body: &Value) -> (StatusCode, Value) {
+    let bytes = serde_json::to_vec(body).unwrap();
+    let (status, bytes) = send(app, "POST", "/v1/vms", Some(auth), bytes).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 /// An instance of tenant `stage` with a known launch time.
@@ -406,7 +442,7 @@ async fn a_failed_terminate_keeps_the_pending_payload() {
     let h = harness().await;
     h.fake.seed(stage_vm(ID, "lima", "pending", "t3a.medium"));
     h.state.bootstrap.insert("token", empty_payload(), ID);
-    h.fake.fail_actions(true);
+    h.fake.fail_writes(true);
     let (status, _) = call_raw(&h.app, "DELETE", &format!("/v1/vms/{ID}"), Some(STAGE)).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     // The VM still exists, so it can still redeem its token.
@@ -426,7 +462,7 @@ async fn actions_are_502_when_aws_fails() {
         ));
         match mode {
             "lookup" => h.fake.fail(true),
-            _ => h.fake.fail_actions(true),
+            _ => h.fake.fail_writes(true),
         }
         let calls = [
             ("POST", format!("/v1/vms/{ID}/stop")),
@@ -445,5 +481,271 @@ async fn actions_are_502_when_aws_fails() {
         h.fake.fail(false);
         assert_eq!(h.fake.instance(ID).unwrap().state, "running", "{mode}");
         assert!(h.fake.actions().is_empty(), "{mode}");
+    }
+}
+
+#[tokio::test]
+async fn create_without_a_key_is_401() {
+    let h = harness().await;
+    let (status, _) = send(&h.app, "POST", "/v1/vms", None, b"{}".to_vec()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(h.fake.launches().is_empty());
+}
+
+#[tokio::test]
+async fn create_launches_a_tagged_vm_with_the_defaults() {
+    let h = harness().await;
+    let (status, vm) = create(&h.app, STAGE, &create_body("lima")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let launches = h.fake.launches();
+    assert_eq!(launches.len(), 1);
+    let launch = &launches[0];
+    let got = (
+        launch.tenant.as_str(),
+        launch.name.as_str(),
+        launch.instance_type.as_str(),
+    );
+    assert_eq!(got, ("stage", "lima", "t3a.medium"));
+    assert_eq!(vm["name"], "lima");
+    assert_eq!(vm["state"], "pending");
+    assert_eq!(vm["setup"], "pending");
+    assert_eq!(vm["instance_type"], "t3a.medium");
+    assert_eq!(vm["sev_snp"], false);
+    assert_eq!(vm["public_ip"], Value::Null);
+    // The 201 shows the same VM that the list shows.
+    let (_, listed) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
+    assert_eq!(listed, json!([vm]));
+}
+
+#[tokio::test]
+async fn create_uses_the_requested_type() {
+    let h = harness().await;
+    let mut body = create_body("lima");
+    body["instance_type"] = json!("m6a.large");
+    let (status, vm) = create(&h.app, STAGE, &body).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(vm["instance_type"], "m6a.large");
+    assert_eq!(vm["sev_snp"], true);
+    assert_eq!(h.fake.launches()[0].instance_type, "m6a.large");
+}
+
+/// A valid request with one change.
+fn with(edit: impl FnOnce(&mut Value)) -> Value {
+    let mut body = create_body("lima");
+    edit(&mut body);
+    body
+}
+
+#[tokio::test]
+async fn create_rejects_invalid_input_with_400() {
+    let h = harness().await;
+    let mut cases: Vec<(String, Value)> = Vec::new();
+    let long = "a".repeat(64);
+    for name in ["", "Lima", "-lima", "li_ma", "li ma", long.as_str()] {
+        cases.push((format!("name {name:?}"), with(|b| b["name"] = json!(name))));
+    }
+    cases.push(("name is a number".into(), with(|b| b["name"] = json!(5))));
+    for t in ["t3a.xlarge", "T3A.MEDIUM", "", " t3a.medium", "m5.large"] {
+        cases.push((
+            format!("type {t:?}"),
+            with(|b| b["instance_type"] = json!(t)),
+        ));
+    }
+    for path in ["home/x", "", "/a/../b", "/.."] {
+        let edit = |b: &mut Value| b["bootstrap"]["files"][0]["path"] = json!(path);
+        cases.push((format!("path {path:?}"), with(edit)));
+    }
+    for mode in ["8", "12345", "rwx", ""] {
+        let edit = |b: &mut Value| b["bootstrap"]["files"][0]["mode"] = json!(mode);
+        cases.push((format!("mode {mode:?}"), with(edit)));
+    }
+    for owner in ["Root", "1abc", ""] {
+        let edit = |b: &mut Value| b["bootstrap"]["files"][0]["owner"] = json!(owner);
+        cases.push((format!("owner {owner:?}"), with(edit)));
+    }
+    let edit = |b: &mut Value| b["bootstrap"]["script"] = json!("");
+    cases.push(("empty script".into(), with(edit)));
+    let edit = |b: &mut Value| drop(b["bootstrap"].as_object_mut().unwrap().remove("script"));
+    cases.push(("missing script".into(), with(edit)));
+    let edit = |b: &mut Value| drop(b.as_object_mut().unwrap().remove("bootstrap"));
+    cases.push(("missing bootstrap".into(), with(edit)));
+    let edit = |b: &mut Value| drop(b.as_object_mut().unwrap().remove("name"));
+    cases.push(("missing name".into(), with(edit)));
+    let edit = |b: &mut Value| b["bootstrap"]["files"] = json!("x");
+    cases.push(("files is not an array".into(), with(edit)));
+    let edit = |b: &mut Value| b["bootstrap"]["files"][0]["content"] = json!(7);
+    cases.push(("content is not a string".into(), with(edit)));
+
+    for (label, body) in &cases {
+        let (status, resp) = create(&h.app, STAGE, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+        assert!(resp["error"].is_string(), "{label}");
+    }
+    for raw in [&b"nope"[..], b"", b"[]", b"null", b"{\"name\":"] {
+        let (status, bytes) = send(&h.app, "POST", "/v1/vms", Some(STAGE), raw.to_vec()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{raw:?}");
+        let resp: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(resp["error"].is_string(), "{raw:?}");
+    }
+    assert!(h.fake.launches().is_empty());
+}
+
+#[tokio::test]
+async fn create_accepts_the_edges_of_the_rules() {
+    let h = harness().await;
+    let long = "a".repeat(63);
+    for name in [long.as_str(), "9", "a-", "0-0"] {
+        let (status, vm) = create(&h.app, STAGE, &create_body(name)).await;
+        assert_eq!(status, StatusCode::CREATED, "{name}");
+        assert_eq!(vm["name"], name);
+    }
+    // `null` means the default type, and there may be no files at all.
+    let edit = |b: &mut Value| {
+        b["instance_type"] = Value::Null;
+        b["bootstrap"]["files"] = json!([]);
+    };
+    let (status, vm) = create(&h.app, STAGE, &with(edit)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(vm["instance_type"], "t3a.medium");
+}
+
+#[tokio::test]
+async fn name_check_is_per_tenant_and_ignores_terminated_vms() {
+    let h = harness().await;
+    h.fake.seed(stage_vm(
+        "i-0000000000000001",
+        "lima",
+        "running",
+        "t3a.medium",
+    ));
+    h.fake.seed(stage_vm(
+        "i-0000000000000002",
+        "sleepy",
+        "stopped",
+        "t3a.medium",
+    ));
+    h.fake.seed(stage_vm(
+        "i-0000000000000003",
+        "leaving",
+        "shutting-down",
+        "t3a.medium",
+    ));
+    h.fake.seed(stage_vm(
+        "i-0000000000000004",
+        "old",
+        "terminated",
+        "t3a.medium",
+    ));
+    h.fake.seed(fake::instance(
+        "i-0000000000000005",
+        "shared",
+        Some("prod-sim"),
+        "running",
+        "t3a.medium",
+    ));
+    h.fake.seed(fake::instance(
+        "i-0000000000000006",
+        "legacy",
+        None,
+        "running",
+        "t3a.medium",
+    ));
+    for name in ["lima", "sleepy", "leaving"] {
+        let (status, body) = create(&h.app, STAGE, &create_body(name)).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::CONFLICT, json!({ "error": "name in use" })),
+            "{name}"
+        );
+    }
+    assert!(h.fake.launches().is_empty());
+    // Another tenant may use the name. So may a stage VM when only a terminated VM, a VM of
+    // another tenant, or a VM without a tenant has it.
+    for (auth, name) in [
+        (PROD, "lima"),
+        (STAGE, "old"),
+        (STAGE, "shared"),
+        (STAGE, "legacy"),
+    ] {
+        let (status, _) = create(&h.app, auth, &create_body(name)).await;
+        assert_eq!(status, StatusCode::CREATED, "{auth} {name}");
+    }
+}
+
+#[tokio::test]
+async fn concurrent_creates_of_one_name_launch_once() {
+    let h = harness().await;
+    let body = create_body("lima");
+    let one = create(&h.app, STAGE, &body);
+    let two = create(&h.app, STAGE, &body);
+    let ((a, _), (b, _)) = tokio::join!(one, two);
+    let mut statuses = [a, b];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::CREATED, StatusCode::CONFLICT]);
+    assert_eq!(h.fake.launches().len(), 1);
+}
+
+/// A valid create request of exactly `len` bytes.
+fn body_of_len(name: &str, len: usize) -> Vec<u8> {
+    let mut body = create_body(name);
+    body["bootstrap"]["files"][0]["content"] = json!("");
+    let base = serde_json::to_vec(&body).unwrap().len();
+    body["bootstrap"]["files"][0]["content"] = json!("x".repeat(len - base));
+    let bytes = serde_json::to_vec(&body).unwrap();
+    assert_eq!(bytes.len(), len);
+    bytes
+}
+
+#[tokio::test]
+async fn body_limit_is_256_kib() {
+    let h = harness().await;
+    let exact = body_of_len("exact", 256 * 1024);
+    let (status, _) = send(&h.app, "POST", "/v1/vms", Some(STAGE), exact).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let over = body_of_len("over", 256 * 1024 + 1);
+    let (status, _) = send(&h.app, "POST", "/v1/vms", Some(STAGE), over).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(h.fake.launches().len(), 1);
+}
+
+#[tokio::test]
+async fn user_data_holds_the_stub_and_the_store_holds_the_payload() {
+    let h = harness().await;
+    let (_, vm) = create(&h.app, STAGE, &create_body("lima")).await;
+    let user_data = &h.fake.launches()[0].user_data;
+    let script = String::from_utf8(STANDARD.decode(user_data).unwrap()).unwrap();
+    assert!(script.starts_with("#!/bin/bash\n"));
+    assert!(script.contains("\nURL='https://cp.example.org/v1/bootstrap'\n"));
+    let token = (script.lines())
+        .find_map(|l| l.strip_prefix("TOKEN='")?.strip_suffix('\''))
+        .expect("a TOKEN= line");
+    let (payload, instance) = h.state.bootstrap.redeem(token).expect("the token redeems");
+    assert_eq!(vm["id"], json!(instance));
+    assert_eq!(
+        serde_json::to_value(&payload).unwrap(),
+        create_body("lima")["bootstrap"]
+    );
+}
+
+#[tokio::test]
+async fn create_is_502_and_launches_nothing_when_aws_fails() {
+    for mode in ["lookup", "launch"] {
+        let h = harness().await;
+        match mode {
+            "lookup" => h.fake.fail(true),
+            _ => h.fake.fail_writes(true),
+        }
+        let (status, body) = create(&h.app, STAGE, &create_body("lima")).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::BAD_GATEWAY, aws_failed()),
+            "{mode}"
+        );
+        assert!(h.fake.launches().is_empty(), "{mode}");
+        // Nothing is stuck: the same request works when AWS is back.
+        h.fake.fail(false);
+        h.fake.fail_writes(false);
+        let (status, _) = create(&h.app, STAGE, &create_body("lima")).await;
+        assert_eq!(status, StatusCode::CREATED, "{mode}");
     }
 }

@@ -1,19 +1,24 @@
 use aws_sdk_ec2::primitives::DateTimeFormat;
 use axum::{
     Extension, Json,
+    body::Bytes,
     extract::{Path, State},
     http::StatusCode,
     routing::{MethodRouter, post},
 };
-use serde::Serialize;
+use base64::{Engine, engine::general_purpose::STANDARD};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     AppState,
     auth::Client,
-    bootstrap::Store,
-    ec2::{self, Action, Instance},
+    bootstrap::{self, Payload, Store},
+    ec2::{self, Action, Instance, Launch},
     error::AppError,
 };
+
+/// The largest body of `POST /v1/vms`. A larger one gives 413.
+pub const MAX_BODY: usize = 256 * 1024;
 
 #[derive(Serialize)]
 pub struct InstanceType {
@@ -155,4 +160,78 @@ pub async fn delete(
     state.bootstrap.remove_instance(&vm.id);
     tracing::info!(tenant = %client.name, vm = %vm.id, "vm deleted");
     Ok(StatusCode::ACCEPTED)
+}
+
+#[derive(Deserialize)]
+struct CreateVm {
+    name: String,
+    instance_type: Option<String>,
+    bootstrap: Payload,
+}
+
+/// `^[a-z0-9][a-z0-9-]{0,62}$`
+fn valid_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    (1..=63).contains(&b.len())
+        && b[0] != b'-'
+        && b.iter()
+            .all(|c| matches!(c, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+}
+
+pub async fn create(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Vm>), AppError> {
+    // A fixed message: a serde error can echo a value of the payload.
+    let request: CreateVm = serde_json::from_slice(&body)
+        .map_err(|_| AppError::BadRequest("invalid request body".to_owned()))?;
+    if !valid_name(&request.name) {
+        let message = "name must match ^[a-z0-9][a-z0-9-]{0,62}$";
+        return Err(AppError::BadRequest(message.to_owned()));
+    }
+    let instance_type =
+        (request.instance_type.as_deref()).unwrap_or(&state.vm.default_instance_type);
+    if !state.vm.instance_types.iter().any(|t| t == instance_type) {
+        return Err(AppError::BadRequest(
+            "instance_type is not allowed".to_owned(),
+        ));
+    }
+    request
+        .bootstrap
+        .validate()
+        .map_err(|e| AppError::BadRequest(e.to_owned()))?;
+
+    // ponytail: one lock for every create, held across the AWS calls (about 3 s). It stops
+    // two requests with one name from both passing the check. Use a lock per tenant and
+    // name if creates must run in parallel. With more than one control plane instance it
+    // needs a shared lock.
+    let _guard = state.create_lock.lock().await;
+    // ponytail: relies on EC2 read-after-write. A describe right after `RunInstances` can
+    // miss the new VM, so two creates of one name a moment apart can both pass. Keep the
+    // names of recent launches in memory if that ever happens.
+    let taken = (state.ec2.list(&client.name).await?)
+        .iter()
+        .any(|i| visible(i, &client.name) && i.name == request.name);
+    if taken {
+        return Err(AppError::Conflict("name in use".to_owned()));
+    }
+
+    let token = bootstrap::new_token();
+    let launch = Launch {
+        name: request.name,
+        tenant: client.name.clone(),
+        instance_type: instance_type.to_owned(),
+        user_data: STANDARD.encode(bootstrap::stub(&state.vm.public_url, &token)),
+    };
+    let instance = state.ec2.launch(&launch).await?;
+    // No await between the launch and the insert: the VM cannot redeem before the entry exists.
+    state
+        .bootstrap
+        .insert(&token, request.bootstrap, &instance.id);
+    tracing::info!(tenant = %client.name, vm = %instance.id, %instance_type, "vm launched");
+    Ok((
+        StatusCode::CREATED,
+        Json(Vm::new(&instance, &state.bootstrap)),
+    ))
 }
