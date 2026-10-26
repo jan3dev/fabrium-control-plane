@@ -180,6 +180,8 @@ as_ubuntu bash -lc 'set -a; . /run/fabrium-agent-secrets.env; set +a; bash ~/fab
 
 `<ZOOID_COMMIT>` is the full commit of the running zooid image. The VM fetches it from the public `jan3dev/fabrium-web-ui` repository, so the commit must be pushed.
 
+Added after the first stage test: the secrets file also holds `FABRIUM_CREATOR='<user id>'`, the user who asked for the VM. After `configure-agent.sh`, the script runs `deploy/agent-vm/greet-creator.sh` the same way. The agent opens a direct room with the creator and sends a first message that its model writes. A failure of this step does not fail the setup.
+
 ## 4. Tags
 
 | Key | Value | Set by | When |
