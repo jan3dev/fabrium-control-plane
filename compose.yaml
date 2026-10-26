@@ -1,6 +1,8 @@
 services:
   control-plane:
     build: .
+    # Built on a bigger machine and loaded on the control host. See the README.
+    image: fabrium-control-plane:${CP_TAG:-latest}
     env_file: .env
     ports:
       - "127.0.0.1:8080:8080"

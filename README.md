@@ -206,30 +206,50 @@ The AWS account needs these resources before the first create. The service looks
 
 The host runs Docker Compose with Caddy in front of the service. Caddy gets the TLS certificate. For tests, use the host name `<ip-with-dashes>.sslip.io`. Open the ports 80 and 443 in the firewall.
 
-1. Clone the repository on the host.
+The `control` instance has 1.9 GiB of RAM, and the build of the image needs more than 8 GiB (see [Build memory](#build-memory)). So the image is built on another machine, and the host only loads it and runs it. Each image has a tag, for example the short commit. `compose.yaml` names the image `fabrium-control-plane:${CP_TAG:-latest}`.
+
+1. On a build machine with at least 10 GiB of RAM, clone the repository, build the image, and save it. The host is x86_64, so build on an x86_64 machine.
+
+   ```sh
+   git clone https://github.com/jan3dev/fabrium-control-plane.git
+   cd fabrium-control-plane
+   TAG=$(git rev-parse --short HEAD)
+   docker build -t fabrium-control-plane:$TAG .
+   docker save fabrium-control-plane:$TAG | gzip > fabrium-control-plane-$TAG.tar.gz
+   ```
+
+2. Copy the file to the control host and load it there. A registry works too: pull the image on the host and give it the name `fabrium-control-plane:<tag>` with `docker tag`.
+
+   ```sh
+   docker load < fabrium-control-plane-<tag>.tar.gz
+   ```
+
+3. On the control host, clone the repository for the Compose files and the `Caddyfile`. Nothing is built there.
 
    ```sh
    git clone https://github.com/jan3dev/fabrium-control-plane.git
    cd fabrium-control-plane
    ```
 
-2. Create `.env` and set every variable of [Configuration](#configuration) that has no default: `API_KEYS`, `PUBLIC_URL`, `CP_HOST`, and the AWS credentials. `PUBLIC_URL` is `https://` plus `CP_HOST`.
+4. Create `.env` and set every variable of [Configuration](#configuration) that has no default: `API_KEYS`, `PUBLIC_URL`, `CP_HOST`, and the AWS credentials. `PUBLIC_URL` is `https://` plus `CP_HOST`.
 
    ```sh
    cp .env.example .env
    ```
 
-3. Start the service and Caddy. Read [Build memory](#build-memory) first.
+5. Start the service and Caddy with the image that you loaded. `--no-build` keeps Compose from building on the host.
 
    ```sh
-   docker compose -f compose.yaml -f compose.caddy.yaml up -d --build
+   CP_TAG=<tag> docker compose -f compose.yaml -f compose.caddy.yaml up -d --no-build
    ```
 
-4. Check it.
+6. Check it.
 
    ```sh
    curl -i https://<host>/health
    ```
+
+To update, build a new tag, load it on the host, and run step 5 with the new tag. If the Compose files changed, update the clone on the host first.
 
 `compose.caddy.yaml` adds the `caddy` service on the ports 80 and 443, with the named volumes `caddy_data` and `caddy_config`. The `Caddyfile` sends every request to `control-plane:8080`. Caddy sees only `CP_HOST`, not the AWS keys.
 
@@ -243,7 +263,7 @@ The AWS SDK crate `aws-sdk-ec2` is very large. Measured on a 5-core machine:
 | Release, SDK crate at `opt-level = 0` | 4 min | 7.3 GiB |
 | Release, default profile (what the Dockerfile builds) | 7.5 min | 8.3 GiB |
 
-The `control` instance has 1.9 GiB of RAM, so the build runs out of memory there. Build the image on a machine with at least 10 GiB of free RAM, and load it on the host with `docker save` and `docker load`. A registry works too. A large swap file only makes the build very slow.
+The compiler alone peaks at 8.3 GiB, so a machine with 8 GiB of RAM is not enough without swap. Use 10 GiB or more. On the `control` instance, `docker compose up --build` fails with an out-of-memory error, and a large swap file only makes the build very slow.
 
 ## IAM
 

@@ -1,6 +1,8 @@
 # Puts Caddy in front of the control plane. Caddy gets the TLS certificate.
 #
-#   docker compose -f compose.yaml -f compose.caddy.yaml up -d --build
+#   CP_TAG=<tag> docker compose -f compose.yaml -f compose.caddy.yaml up -d --no-build
+#
+# The image is built on a bigger machine and loaded on the host. See "Deploy" in the README.
 #
 # `.env` must set CP_HOST, the host name that Caddy serves. Caddy does not read the rest
 # of `.env`, so the AWS keys stay out of its container.
