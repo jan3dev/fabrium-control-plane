@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use fabrium_control_plane::{AppState, build_app, config::Config, db};
+use fabrium_control_plane::{AppState, build_app, config::Config, db, ec2::AwsEc2};
 use tokio::{net::TcpListener, signal};
 use tracing_subscriber::EnvFilter;
 
@@ -14,10 +14,19 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let db = db::connect(&config.database_url).await?;
-    let app = build_app(AppState {
-        db,
-        api_keys: Arc::new(config.api_keys),
-    });
+    let vm = &config.vm;
+    tracing::info!(
+        region = %vm.aws_region,
+        ami = %vm.ami_name,
+        security_group = %vm.security_group,
+        key_name = %vm.key_name,
+        instance_types = ?vm.instance_types,
+        default_instance_type = %vm.default_instance_type,
+        public_url = %vm.public_url,
+        "vm settings"
+    );
+    let ec2 = Arc::new(AwsEc2::connect(vm).await);
+    let app = build_app(AppState::new(db, config.api_keys, config.vm, ec2));
 
     let listener = TcpListener::bind(config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "listening");

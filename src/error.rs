@@ -9,6 +9,21 @@ use serde_json::json;
 pub enum AppError {
     #[error("missing or invalid API key")]
     Unauthorized,
+    #[error("{0}")]
+    BadRequest(String),
+    #[error("not found")]
+    NotFound,
+    #[error("{0}")]
+    Conflict(String),
+    /// The detail is for the log. The body says only that the request failed.
+    #[error("aws request failed")]
+    Aws(String),
+}
+
+impl From<anyhow::Error> for AppError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Aws(format!("{e:#}"))
+    }
 }
 
 impl IntoResponse for AppError {
@@ -21,6 +36,13 @@ impl IntoResponse for AppError {
                 body,
             )
                 .into_response(),
+            Self::BadRequest(_) => (StatusCode::BAD_REQUEST, body).into_response(),
+            Self::NotFound => (StatusCode::NOT_FOUND, body).into_response(),
+            Self::Conflict(_) => (StatusCode::CONFLICT, body).into_response(),
+            Self::Aws(detail) => {
+                tracing::error!(%detail, "aws request failed");
+                (StatusCode::BAD_GATEWAY, body).into_response()
+            }
         }
     }
 }
