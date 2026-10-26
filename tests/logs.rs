@@ -8,6 +8,7 @@ mod common;
 use std::{
     io,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use common::*;
@@ -57,20 +58,39 @@ async fn logs_never_hold_a_token_a_key_or_the_payload() {
     // The error paths log too: a failed tag, a failed create, a failed delete.
     h.fake.fail_tagging(true);
     redeem(&h, &token).await;
+    settle().await; // the tag call runs after the answer
     h.fake.fail(true);
     create(&h.app, STAGE, &create_body("other")).await;
     call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
     h.fake.fail(false);
     let uri = format!("/v1/vms/{}", vm["id"].as_str().unwrap());
     call_raw(&h.app, "DELETE", &uri, Some(STAGE)).await;
+    // A tag call that hangs is cut off after 5 s, and that is logged too.
+    h.fake.fail_tagging(false);
+    create(&h.app, STAGE, &create_body("slow")).await;
+    let slow_token = token_in(&h.fake.launches()[1].user_data);
+    h.fake.hang_tagging(true);
+    tokio::time::pause();
+    redeem(&h, &slow_token).await;
+    settle().await; // the tag call starts, and hangs
+    tokio::time::advance(Duration::from_secs(6)).await;
+    settle().await; // the 5 s limit fires
 
     let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
     // The capture works: these lines exist.
-    for line in ["vm launched", "tagging", "aws request failed", "vm deleted"] {
+    let lines = [
+        "vm launched",
+        "tagging",
+        "aws request failed",
+        "vm deleted",
+        "timed out",
+    ];
+    for line in lines {
         assert!(logs.contains(line), "no {line:?} in the log:\n{logs}");
     }
     for secret in [
         token.as_str(),
+        slow_token.as_str(),
         "MARKER-FILE-CONTENT",
         "MARKER-SCRIPT",
         "stage-secret",

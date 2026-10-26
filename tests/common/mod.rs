@@ -141,6 +141,13 @@ pub async fn create(app: &Router, auth: &str, body: &Value) -> (StatusCode, Valu
     )
 }
 
+/// Lets the tasks that a handler left behind run. The runtime of a test has one thread.
+pub async fn settle() {
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+}
+
 /// The token in the user data of a launch.
 pub fn token_in(user_data: &str) -> String {
     let script = String::from_utf8(STANDARD.decode(user_data).unwrap()).unwrap();

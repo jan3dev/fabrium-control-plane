@@ -667,6 +667,7 @@ async fn redeem_returns_the_payload_once() {
     let (status, body) = redeem(&h, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, create_body("lima")["bootstrap"]);
+    settle().await; // the tag is set after the answer
     assert!(
         h.fake
             .instance(vm["id"].as_str().unwrap())
@@ -787,6 +788,7 @@ async fn redeem_still_delivers_when_tagging_fails() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, create_body("lima")["bootstrap"]);
     // The token is used up all the same, and the VM is not marked.
+    settle().await; // the failed tag call runs after the answer
     assert_eq!(redeem(&h, &token).await.0, StatusCode::NOT_FOUND);
     assert!(
         !h.fake
@@ -797,18 +799,22 @@ async fn redeem_still_delivers_when_tagging_fails() {
 }
 
 #[tokio::test]
-async fn redeem_still_delivers_when_tagging_hangs() {
+async fn redeem_answers_without_waiting_for_the_tag() {
     let h = harness().await;
     create(&h.app, STAGE, &create_body("lima")).await;
     let token = token_in(&h.fake.launches()[0].user_data);
     h.fake.hang_tagging(true);
-    // With the clock paused, a wait of 5 s takes no time. The outer limit makes a
-    // handler that waits for ever fail the test instead of hanging it.
     tokio::time::pause();
-    let redeemed = tokio::time::timeout(Duration::from_secs(30), redeem(&h, &token)).await;
-    let (status, body) = redeemed.expect("the redeem must not wait for the tag");
+    let start = tokio::time::Instant::now();
+    let (status, body) = redeem(&h, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, create_body("lima")["bootstrap"]);
+    // With the clock paused, a wait for the tag shows as seconds.
+    let waited = start.elapsed();
+    assert!(
+        waited < Duration::from_secs(1),
+        "the redeem waited {waited:?} for the tag"
+    );
 }
 
 #[tokio::test]
