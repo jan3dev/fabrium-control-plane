@@ -290,6 +290,27 @@ async fn unknown_foreign_untagged_terminated_and_malformed_ids_are_404() {
 }
 
 #[tokio::test]
+async fn an_id_that_is_not_utf8_is_404_like_any_other_bad_id() {
+    let h = harness().await;
+    let calls = [
+        ("POST", "/v1/vms/%FF/start"),
+        ("POST", "/v1/vms/%FF/stop"),
+        ("POST", "/v1/vms/%FF/reboot"),
+        ("POST", "/v1/vms/i-%FFabc/start"),
+        ("DELETE", "/v1/vms/%C3%28"),
+    ];
+    for (method, uri) in calls {
+        let (status, body) = call(&h.app, method, uri, Some(STAGE)).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::NOT_FOUND, not_found()),
+            "{method} {uri}"
+        );
+    }
+    assert!(h.fake.actions().is_empty());
+}
+
+#[tokio::test]
 async fn delete_terminates_in_every_listed_state() {
     for state in STATES {
         let h = harness().await;

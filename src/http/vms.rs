@@ -2,7 +2,7 @@ use aws_sdk_ec2::primitives::DateTimeFormat;
 use axum::{
     Extension, Json,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, State, rejection::PathRejection},
     http::StatusCode,
     routing::{MethodRouter, post},
 };
@@ -112,6 +112,12 @@ fn valid_id(id: &str) -> bool {
     })
 }
 
+/// An id that does not decode, such as `%FF`, is a bad id like any other: a `404`, not the
+/// plain-text `400` of the extractor.
+fn id_of(id: Result<Path<String>, PathRejection>) -> Result<String, AppError> {
+    id.map(|Path(id)| id).map_err(|_| AppError::NotFound)
+}
+
 /// The VM, if it exists and the tenant owns it. Every other case is "not found", so a
 /// response never shows that a VM of another tenant exists.
 async fn find(state: &AppState, tenant: &str, id: &str) -> Result<Instance, AppError> {
@@ -127,9 +133,9 @@ async fn find(state: &AppState, tenant: &str, id: &str) -> Result<Instance, AppE
 /// than the API does, so the state table is checked here.
 pub fn action(action: Action) -> MethodRouter<AppState> {
     post(
-        move |state: State<AppState>, client: Extension<Client>, id: Path<String>| {
-            apply(action, state, client, id)
-        },
+        move |state: State<AppState>,
+              client: Extension<Client>,
+              id: Result<Path<String>, PathRejection>| apply(action, state, client, id),
     )
 }
 
@@ -137,8 +143,9 @@ async fn apply(
     action: Action,
     State(state): State<AppState>,
     Extension(client): Extension<Client>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
 ) -> Result<(StatusCode, Json<Vm>), AppError> {
+    let id = id_of(id)?;
     let mut vm = find(&state, &client.name, &id).await?;
     if action.allowed_from().is_some_and(|from| from != vm.state) {
         return Err(AppError::Conflict(format!("vm is {}", vm.state)));
@@ -153,8 +160,9 @@ async fn apply(
 pub async fn delete(
     State(state): State<AppState>,
     Extension(client): Extension<Client>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
 ) -> Result<StatusCode, AppError> {
+    let id = id_of(id)?;
     let vm = find(&state, &client.name, &id).await?;
     state.ec2.act(&vm.id, Action::Terminate).await?;
     // The VM is gone, so nobody can redeem its payload. A failed terminate keeps the entry.
