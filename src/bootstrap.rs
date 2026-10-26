@@ -103,6 +103,10 @@ pub struct Store {
 struct Entry {
     payload: Payload,
     instance: String,
+    /// The tenant and the name of the VM, so that a VM that EC2 does not list yet still
+    /// holds its name.
+    tenant: String,
+    name: String,
     expires: Instant,
 }
 
@@ -120,13 +124,15 @@ impl Store {
     }
 
     /// Keeps the payload for `ttl`. Also drops the entries that have expired.
-    pub fn insert(&self, token: &str, payload: Payload, instance: &str) {
+    pub fn insert(&self, token: &str, payload: Payload, instance: &str, tenant: &str, name: &str) {
         let now = Instant::now();
         let mut entries = self.entries();
         entries.retain(|_, e| e.expires > now);
         let entry = Entry {
             payload,
             instance: instance.to_owned(),
+            tenant: tenant.to_owned(),
+            name: name.to_owned(),
             expires: now + self.ttl,
         };
         entries.insert(hash(token), entry);
@@ -142,6 +148,12 @@ impl Store {
     pub fn has_live(&self, instance: &str) -> bool {
         let now = Instant::now();
         (self.entries().values()).any(|e| e.instance == instance && e.expires > now)
+    }
+
+    /// True if a VM of the tenant with this name is still waiting for its token.
+    pub fn name_in_use(&self, tenant: &str, name: &str) -> bool {
+        let now = Instant::now();
+        (self.entries().values()).any(|e| e.tenant == tenant && e.name == name && e.expires > now)
     }
 
     pub fn remove_instance(&self, instance: &str) {
@@ -192,7 +204,7 @@ mod tests {
     #[test]
     fn redeem_is_single_use() {
         let store = Store::new(TTL);
-        store.insert("tok", payload(), "i-1");
+        store.insert("tok", payload(), "i-1", "stage", "lima");
         let (got, instance) = store.redeem("tok").unwrap();
         assert!(got == payload());
         assert_eq!(instance, "i-1");
@@ -202,7 +214,7 @@ mod tests {
     #[test]
     fn unknown_token_does_not_redeem() {
         let store = Store::new(TTL);
-        store.insert("tok", payload(), "i-1");
+        store.insert("tok", payload(), "i-1", "stage", "lima");
         assert!(store.redeem("other").is_none());
         assert!(store.redeem("").is_none());
         // A wrong guess does not burn the real token.
@@ -212,7 +224,7 @@ mod tests {
     #[test]
     fn expired_entry_is_not_live_and_does_not_redeem() {
         let store = Store::new(Duration::ZERO);
-        store.insert("tok", payload(), "i-1");
+        store.insert("tok", payload(), "i-1", "stage", "lima");
         assert!(!store.has_live("i-1"));
         assert!(store.redeem("tok").is_none());
     }
@@ -221,14 +233,14 @@ mod tests {
     fn has_live_follows_the_entry() {
         let store = Store::new(TTL);
         assert!(!store.has_live("i-1"));
-        store.insert("tok", payload(), "i-1");
+        store.insert("tok", payload(), "i-1", "stage", "lima");
         assert!(store.has_live("i-1"));
         assert!(!store.has_live("i-2"));
         store.redeem("tok").unwrap();
         assert!(!store.has_live("i-1"));
 
-        store.insert("tok2", payload(), "i-1");
-        store.insert("tok3", payload(), "i-2");
+        store.insert("tok2", payload(), "i-1", "stage", "lima");
+        store.insert("tok3", payload(), "i-2", "stage", "other");
         store.remove_instance("i-1");
         assert!(!store.has_live("i-1"));
         assert!(store.redeem("tok2").is_none());
@@ -236,10 +248,34 @@ mod tests {
     }
 
     #[test]
+    fn a_live_entry_holds_the_name_of_its_vm() {
+        let store = Store::new(TTL);
+        assert!(!store.name_in_use("stage", "lima"));
+        store.insert("tok", payload(), "i-1", "stage", "lima");
+        assert!(store.name_in_use("stage", "lima"));
+        // The name is per tenant.
+        assert!(!store.name_in_use("prod", "lima"));
+        assert!(!store.name_in_use("stage", "other"));
+        // A VM that redeemed its token, or was deleted, is known to EC2 or gone.
+        store.redeem("tok").unwrap();
+        assert!(!store.name_in_use("stage", "lima"));
+        store.insert("tok2", payload(), "i-2", "stage", "other");
+        store.remove_instance("i-2");
+        assert!(!store.name_in_use("stage", "other"));
+    }
+
+    #[test]
+    fn an_expired_entry_does_not_hold_a_name() {
+        let store = Store::new(Duration::ZERO);
+        store.insert("tok", payload(), "i-1", "stage", "lima");
+        assert!(!store.name_in_use("stage", "lima"));
+    }
+
+    #[test]
     fn insert_drops_expired_entries() {
         let store = Store::new(Duration::ZERO);
-        store.insert("a", payload(), "i-1");
-        store.insert("b", payload(), "i-2");
+        store.insert("a", payload(), "i-1", "stage", "lima");
+        store.insert("b", payload(), "i-2", "stage", "other");
         // Only the entry that was just inserted can be left.
         assert_eq!(store.entries().len(), 1);
     }
@@ -247,7 +283,7 @@ mod tests {
     #[test]
     fn store_keeps_only_the_hash() {
         let store = Store::new(TTL);
-        store.insert("tok", payload(), "i-1");
+        store.insert("tok", payload(), "i-1", "stage", "lima");
         let keys: Vec<[u8; 32]> = store.entries().keys().copied().collect();
         let want: [u8; 32] = Sha256::digest(b"tok").into();
         assert_eq!(keys, [want]);

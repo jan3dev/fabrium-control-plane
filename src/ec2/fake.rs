@@ -53,6 +53,8 @@ struct Inner {
     fail_tagging: bool,
     hang_tagging: bool,
     launch_delay: Duration,
+    hide_launches: bool,
+    launched_ids: Vec<String>,
 }
 
 impl FakeEc2 {
@@ -111,6 +113,12 @@ impl FakeEc2 {
         self.inner().hang_tagging = on;
     }
 
+    /// While on, `list` leaves out the instances that `launch` made, as EC2 can right after
+    /// `RunInstances`. `get` still finds them.
+    pub fn hide_launches(&self, on: bool) {
+        self.inner().hide_launches = on;
+    }
+
     /// `launch` holds the VM at once, as EC2 does when it accepts `RunInstances`, and
     /// answers after `delay`. A caller that gives up in between still has a launched VM.
     pub fn delay_launch(&self, delay: Duration) {
@@ -137,7 +145,14 @@ impl Ec2 for FakeEc2 {
     async fn list(&self, _tenant: &str) -> Result<Vec<Instance>> {
         tokio::task::yield_now().await;
         self.check()?;
-        Ok(self.inner().instances.clone())
+        let inner = self.inner();
+        let hidden = |i: &Instance| inner.hide_launches && inner.launched_ids.contains(&i.id);
+        Ok(inner
+            .instances
+            .iter()
+            .filter(|i| !hidden(i))
+            .cloned()
+            .collect())
     }
 
     async fn get(&self, id: &str) -> Result<Option<Instance>> {
@@ -162,6 +177,7 @@ impl Ec2 for FakeEc2 {
                 &launch.instance_type,
             );
             inner.instances.push(launched.clone());
+            inner.launched_ids.push(id);
             inner.launches.push(launch.clone());
             (launched, inner.launch_delay)
         };
@@ -312,6 +328,27 @@ mod tests {
         // Without the delay, the same call answers.
         fake.delay_launch(Duration::ZERO);
         assert!(fake.launch(&launch("b")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_can_miss_the_instances_that_launch_made() {
+        let fake = FakeEc2::default();
+        fake.seed(instance(
+            "i-00000001",
+            "old",
+            Some("stage"),
+            "running",
+            "t3.medium",
+        ));
+        let launched = fake.launch(&launch("new")).await.unwrap();
+        let names = |list: Vec<Instance>| list.into_iter().map(|i| i.name).collect::<Vec<_>>();
+        assert_eq!(names(fake.list("stage").await.unwrap()), ["old", "new"]);
+        // EC2 can lag right after RunInstances. A lookup by id still finds the VM.
+        fake.hide_launches(true);
+        assert_eq!(names(fake.list("stage").await.unwrap()), ["old"]);
+        assert!(fake.get(&launched.id).await.unwrap().is_some());
+        fake.hide_launches(false);
+        assert_eq!(fake.list("stage").await.unwrap().len(), 2);
     }
 
     #[tokio::test]

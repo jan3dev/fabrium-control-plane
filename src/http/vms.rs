@@ -235,13 +235,13 @@ async fn launch_vm(
     request: CreateVm,
     instance_type: &str,
 ) -> Result<Vm, AppError> {
-    // ponytail: relies on EC2 read-after-write. A describe right after `RunInstances` can
-    // miss the new VM, so two creates of one name a moment apart can both pass. Keep the
-    // names of recent launches in memory if that ever happens.
-    let taken = (state.ec2.list(tenant).await?)
+    // A describe right after `RunInstances` can miss the new VM (EC2 is not read-after-write).
+    // The payload store knows every VM that still waits for its token, so a name that a
+    // recent launch holds counts as in use.
+    let listed = (state.ec2.list(tenant).await?)
         .iter()
         .any(|i| visible(i, tenant) && i.name == request.name);
-    if taken {
+    if listed || state.bootstrap.name_in_use(tenant, &request.name) {
         return Err(AppError::Conflict("name in use".to_owned()));
     }
 
@@ -254,9 +254,8 @@ async fn launch_vm(
     };
     let instance = state.ec2.launch(&launch).await?;
     // No await between the launch and the insert: the VM cannot redeem before the entry exists.
-    state
-        .bootstrap
-        .insert(&token, request.bootstrap, &instance.id);
+    let name = &instance.name;
+    (state.bootstrap).insert(&token, request.bootstrap, &instance.id, tenant, name);
     tracing::info!(%tenant, vm = %instance.id, %instance_type, "vm launched");
     Ok(Vm::new(&instance, &state.bootstrap))
 }

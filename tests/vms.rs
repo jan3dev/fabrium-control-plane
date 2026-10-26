@@ -153,9 +153,13 @@ async fn setup_comes_from_the_tag_then_the_store_then_expiry() {
         "running",
         "t3a.medium",
     ));
-    h.state
-        .bootstrap
-        .insert("token", empty_payload(), "i-0000000000000002");
+    h.state.bootstrap.insert(
+        "token",
+        empty_payload(),
+        "i-0000000000000002",
+        "stage",
+        "pending",
+    );
 
     let (_, body) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
     let setup: Vec<_> = body
@@ -306,7 +310,9 @@ async fn delete_terminates_in_every_listed_state() {
 async fn delete_drops_the_pending_payload() {
     let h = harness().await;
     h.fake.seed(stage_vm(ID, "lima", "pending", "t3a.medium"));
-    h.state.bootstrap.insert("token", empty_payload(), ID);
+    h.state
+        .bootstrap
+        .insert("token", empty_payload(), ID, "stage", "lima");
     let (status, _) = call_raw(&h.app, "DELETE", &format!("/v1/vms/{ID}"), Some(STAGE)).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert!(!h.state.bootstrap.has_live(ID));
@@ -317,7 +323,9 @@ async fn delete_drops_the_pending_payload() {
 async fn a_failed_terminate_keeps_the_pending_payload() {
     let h = harness().await;
     h.fake.seed(stage_vm(ID, "lima", "pending", "t3a.medium"));
-    h.state.bootstrap.insert("token", empty_payload(), ID);
+    h.state
+        .bootstrap
+        .insert("token", empty_payload(), ID, "stage", "lima");
     h.fake.fail_writes(true);
     let (status, _) = call_raw(&h.app, "DELETE", &format!("/v1/vms/{ID}"), Some(STAGE)).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
@@ -546,6 +554,33 @@ async fn name_check_is_per_tenant_and_ignores_terminated_vms() {
         let (status, _) = create(&h.app, auth, &create_body(name)).await;
         assert_eq!(status, StatusCode::CREATED, "{auth} {name}");
     }
+}
+
+#[tokio::test]
+async fn a_pending_launch_holds_its_name() {
+    let h = harness().await;
+    // EC2 can miss a VM that RunInstances just accepted. The payload store knows it.
+    h.fake.hide_launches(true);
+    let (status, vm) = create(&h.app, STAGE, &create_body("lima")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = create(&h.app, STAGE, &create_body("lima")).await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::CONFLICT, json!({ "error": "name in use" }))
+    );
+    assert_eq!(h.fake.launches().len(), 1);
+    // The name is per tenant, and a delete frees it.
+    assert_eq!(
+        create(&h.app, PROD, &create_body("lima")).await.0,
+        StatusCode::CREATED
+    );
+    let uri = format!("/v1/vms/{}", vm["id"].as_str().unwrap());
+    let (status, _) = call_raw(&h.app, "DELETE", &uri, Some(STAGE)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        create(&h.app, STAGE, &create_body("lima")).await.0,
+        StatusCode::CREATED
+    );
 }
 
 #[tokio::test]

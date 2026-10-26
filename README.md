@@ -169,7 +169,7 @@ An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and 
 | `files[].content` | A string. |
 | `script` | A string that is not empty. |
 
-A body larger than 256 KiB gives `413`. If a VM of the same tenant that is not terminated has the name, the result is `409 {"error":"name in use"}`. A VM of another tenant, or a terminated VM, does not count. A VM that you delete keeps its name until EC2 reports it as `terminated`, usually after about a minute, so a create with the same name right after a delete can give `409`.
+A body larger than 256 KiB gives `413`. If a VM of the same tenant that is not terminated has the name, the result is `409 {"error":"name in use"}`. A VM of another tenant, or a terminated VM, does not count. A VM that still waits for its token also holds its name, even if EC2 does not list it yet. A VM that you delete keeps its name until EC2 reports it as `terminated`, usually after about a minute, so a create with the same name right after a delete can give `409`.
 
 ### Actions
 
