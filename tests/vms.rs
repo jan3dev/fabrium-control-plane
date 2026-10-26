@@ -11,7 +11,7 @@ use fabrium_control_plane::{
     build_app,
     config::Config,
     db,
-    ec2::{FakeEc2, Instance, fake},
+    ec2::{Action, FakeEc2, Instance, fake},
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -50,8 +50,13 @@ async fn harness() -> Harness {
     }
 }
 
-/// The status and the JSON body. The body is `Null` if it is empty or not JSON.
-async fn call(app: &Router, method: &str, uri: &str, auth: Option<&str>) -> (StatusCode, Value) {
+/// The status and the raw body.
+async fn call_raw(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    auth: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
     let mut req = Request::builder().method(method).uri(uri);
     if let Some(auth) = auth {
         req = req.header(header::AUTHORIZATION, auth);
@@ -63,6 +68,12 @@ async fn call(app: &Router, method: &str, uri: &str, auth: Option<&str>) -> (Sta
         .unwrap();
     let status = res.status();
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (status, bytes.to_vec())
+}
+
+/// The status and the JSON body. The body is `Null` if it is empty or not JSON.
+async fn call(app: &Router, method: &str, uri: &str, auth: Option<&str>) -> (StatusCode, Value) {
+    let (status, bytes) = call_raw(app, method, uri, auth).await;
     (
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
@@ -132,6 +143,13 @@ async fn vm_routes_need_a_tenant_key() {
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} {auth:?}");
             assert!(body["error"].is_string());
         }
+    }
+}
+
+fn empty_payload() -> Payload {
+    Payload {
+        files: vec![],
+        script: "true".to_owned(),
     }
 }
 
@@ -250,4 +268,182 @@ async fn list_is_502_when_aws_fails() {
     h.fake.fail(true);
     let (status, body) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
     assert_eq!((status, body), (StatusCode::BAD_GATEWAY, aws_failed()));
+}
+
+const ID: &str = "i-0000000000000001";
+const STATES: [&str; 5] = ["pending", "running", "stopping", "stopped", "shutting-down"];
+
+#[tokio::test]
+async fn actions_follow_the_state_table() {
+    // The verb, the action, the one state that it accepts, and the state that it causes.
+    let table = [
+        ("start", Action::Start, "stopped", "pending"),
+        ("stop", Action::Stop, "running", "stopping"),
+        ("reboot", Action::Reboot, "running", "running"),
+    ];
+    for (verb, action, allowed, next) in table {
+        for state in STATES {
+            let h = harness().await;
+            h.fake.seed(stage_vm(ID, "lima", state, "t3a.medium"));
+            let uri = format!("/v1/vms/{ID}/{verb}");
+            let (status, body) = call(&h.app, "POST", &uri, Some(STAGE)).await;
+            if state == allowed {
+                assert_eq!(status, StatusCode::ACCEPTED, "{verb} from {state}");
+                let shown = (
+                    body["id"].as_str(),
+                    body["name"].as_str(),
+                    body["state"].as_str(),
+                );
+                assert_eq!(shown, (Some(ID), Some("lima"), Some(next)), "{verb}");
+                assert_eq!(h.fake.actions(), [(ID.to_owned(), action)], "{verb}");
+                assert_eq!(h.fake.instance(ID).unwrap().state, next, "{verb}");
+            } else {
+                assert_eq!(status, StatusCode::CONFLICT, "{verb} from {state}");
+                assert_eq!(body, json!({ "error": format!("vm is {state}") }));
+                assert!(h.fake.actions().is_empty(), "{verb} from {state}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn unknown_foreign_untagged_terminated_and_malformed_ids_are_404() {
+    let h = harness().await;
+    h.fake.seed(fake::instance(
+        "i-00000000000000a1",
+        "other",
+        Some("prod-sim"),
+        "running",
+        "t3a.medium",
+    ));
+    h.fake.seed(fake::instance(
+        "i-00000000000000a2",
+        "legacy",
+        None,
+        "running",
+        "t3a.medium",
+    ));
+    h.fake.seed(stage_vm(
+        "i-00000000000000a3",
+        "gone",
+        "terminated",
+        "t3a.medium",
+    ));
+    let malformed = [
+        "i-xyz",
+        "i-123",
+        "i-123456789012345678",
+        "i-ABCDEF12",
+        "abc",
+        "i-",
+    ];
+    for id in malformed {
+        // The VM exists and the tenant owns it, so only the id rule can give the 404.
+        h.fake.seed(stage_vm(id, "odd", "running", "t3a.medium"));
+    }
+    let ids = [
+        "i-00000000000000a1", // another tenant
+        "i-00000000000000a2", // no tenant tag
+        "i-00000000000000a3", // terminated
+        "i-00000000000000ff", // unknown
+    ];
+    for id in ids.into_iter().chain(malformed) {
+        let verbs = [
+            ("POST", "/start"),
+            ("POST", "/stop"),
+            ("POST", "/reboot"),
+            ("DELETE", ""),
+        ];
+        for (method, suffix) in verbs {
+            let uri = format!("/v1/vms/{id}{suffix}");
+            let (status, body) = call(&h.app, method, &uri, Some(STAGE)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+            assert_eq!(body, json!({ "error": "not found" }), "{method} {uri}");
+        }
+    }
+    assert!(h.fake.actions().is_empty());
+    // The owner can still act on its own VM, so the 404 above is not a general failure.
+    let (status, _) = call(
+        &h.app,
+        "POST",
+        "/v1/vms/i-00000000000000a1/stop",
+        Some(PROD),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn delete_terminates_in_every_listed_state() {
+    for state in STATES {
+        let h = harness().await;
+        h.fake.seed(stage_vm(ID, "lima", state, "t3a.medium"));
+        let (status, body) =
+            call_raw(&h.app, "DELETE", &format!("/v1/vms/{ID}"), Some(STAGE)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{state}");
+        assert!(body.is_empty(), "{state}");
+        assert_eq!(
+            h.fake.actions(),
+            [(ID.to_owned(), Action::Terminate)],
+            "{state}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delete_drops_the_pending_payload() {
+    let h = harness().await;
+    h.fake.seed(stage_vm(ID, "lima", "pending", "t3a.medium"));
+    h.state.bootstrap.insert("token", empty_payload(), ID);
+    let (status, _) = call_raw(&h.app, "DELETE", &format!("/v1/vms/{ID}"), Some(STAGE)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(!h.state.bootstrap.has_live(ID));
+    assert!(h.state.bootstrap.redeem("token").is_none());
+}
+
+#[tokio::test]
+async fn a_failed_terminate_keeps_the_pending_payload() {
+    let h = harness().await;
+    h.fake.seed(stage_vm(ID, "lima", "pending", "t3a.medium"));
+    h.state.bootstrap.insert("token", empty_payload(), ID);
+    h.fake.fail_actions(true);
+    let (status, _) = call_raw(&h.app, "DELETE", &format!("/v1/vms/{ID}"), Some(STAGE)).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    // The VM still exists, so it can still redeem its token.
+    assert!(h.state.bootstrap.has_live(ID));
+}
+
+#[tokio::test]
+async fn actions_are_502_when_aws_fails() {
+    for mode in ["lookup", "action"] {
+        let h = harness().await;
+        h.fake.seed(stage_vm(ID, "lima", "running", "t3a.medium"));
+        h.fake.seed(stage_vm(
+            "i-0000000000000002",
+            "sleepy",
+            "stopped",
+            "t3a.medium",
+        ));
+        match mode {
+            "lookup" => h.fake.fail(true),
+            _ => h.fake.fail_actions(true),
+        }
+        let calls = [
+            ("POST", format!("/v1/vms/{ID}/stop")),
+            ("POST", format!("/v1/vms/{ID}/reboot")),
+            ("POST", "/v1/vms/i-0000000000000002/start".to_owned()),
+            ("DELETE", format!("/v1/vms/{ID}")),
+        ];
+        for (method, uri) in calls {
+            let (status, body) = call(&h.app, method, &uri, Some(STAGE)).await;
+            assert_eq!(
+                (status, body),
+                (StatusCode::BAD_GATEWAY, aws_failed()),
+                "{mode} {method} {uri}"
+            );
+        }
+        h.fake.fail(false);
+        assert_eq!(h.fake.instance(ID).unwrap().state, "running", "{mode}");
+        assert!(h.fake.actions().is_empty(), "{mode}");
+    }
 }

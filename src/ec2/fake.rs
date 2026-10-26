@@ -46,6 +46,7 @@ struct Inner {
     actions: Vec<(String, Action)>,
     type_calls: usize,
     fail: bool,
+    fail_actions: bool,
     fail_tagging: bool,
 }
 
@@ -83,6 +84,11 @@ impl FakeEc2 {
     /// While on, every call returns an error.
     pub fn fail(&self, on: bool) {
         self.inner().fail = on;
+    }
+
+    /// While on, `act` returns an error. Lookups still work.
+    pub fn fail_actions(&self, on: bool) {
+        self.inner().fail_actions = on;
     }
 
     /// While on, `mark_setup_delivered` returns an error.
@@ -140,6 +146,7 @@ impl Ec2 for FakeEc2 {
     async fn act(&self, id: &str, action: Action) -> Result<()> {
         self.check()?;
         let mut inner = self.inner();
+        ensure!(!inner.fail_actions, "fake EC2 action failure");
         let found = (inner.instances.iter_mut().find(|i| i.id == id))
             .with_context(|| format!("no instance {id}"))?;
         found.state = action.next_state().to_owned();
@@ -226,6 +233,12 @@ mod tests {
         fake.fail_tagging(true);
         assert!(fake.mark_setup_delivered(&i.id).await.is_err());
         assert!(fake.list("stage").await.is_ok());
+        fake.fail_tagging(false);
+        fake.fail_actions(true);
+        assert!(fake.act(&i.id, Action::Stop).await.is_err());
+        assert!(fake.get(&i.id).await.is_ok());
+        assert!(fake.actions().is_empty());
+        fake.fail_actions(false);
         fake.fail(true);
         assert!(fake.list("stage").await.is_err());
         assert!(fake.get(&i.id).await.is_err());

@@ -1,12 +1,17 @@
 use aws_sdk_ec2::primitives::DateTimeFormat;
-use axum::{Extension, Json, extract::State};
+use axum::{
+    Extension, Json,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::{MethodRouter, post},
+};
 use serde::Serialize;
 
 use crate::{
     AppState,
     auth::Client,
     bootstrap::Store,
-    ec2::{self, Instance},
+    ec2::{self, Action, Instance},
     error::AppError,
 };
 
@@ -92,4 +97,62 @@ pub async fn list(
         .collect();
     vms.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
     Ok(Json(vms))
+}
+
+/// `^i-[0-9a-f]{8,17}$`
+fn valid_id(id: &str) -> bool {
+    id.strip_prefix("i-").is_some_and(|hex| {
+        (8..=17).contains(&hex.len()) && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// The VM, if it exists and the tenant owns it. Every other case is "not found", so a
+/// response never shows that a VM of another tenant exists.
+async fn find(state: &AppState, tenant: &str, id: &str) -> Result<Instance, AppError> {
+    if !valid_id(id) {
+        return Err(AppError::NotFound);
+    }
+    (state.ec2.get(id).await?)
+        .filter(|instance| visible(instance, tenant))
+        .ok_or(AppError::NotFound)
+}
+
+/// `POST` route that applies `action` to the VM of the path. EC2 would accept more states
+/// than the API does, so the state table is checked here.
+pub fn action(action: Action) -> MethodRouter<AppState> {
+    post(
+        move |state: State<AppState>, client: Extension<Client>, id: Path<String>| {
+            apply(action, state, client, id)
+        },
+    )
+}
+
+async fn apply(
+    action: Action,
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<Vm>), AppError> {
+    let mut vm = find(&state, &client.name, &id).await?;
+    if action.allowed_from().is_some_and(|from| from != vm.state) {
+        return Err(AppError::Conflict(format!("vm is {}", vm.state)));
+    }
+    state.ec2.act(&vm.id, action).await?;
+    tracing::info!(tenant = %client.name, vm = %vm.id, ?action, "vm action");
+    // EC2 still reports the old state for a moment, so show the state that the action causes.
+    vm.state = action.next_state().to_owned();
+    Ok((StatusCode::ACCEPTED, Json(Vm::new(&vm, &state.bootstrap))))
+}
+
+pub async fn delete(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let vm = find(&state, &client.name, &id).await?;
+    state.ec2.act(&vm.id, Action::Terminate).await?;
+    // The VM is gone, so nobody can redeem its payload. A failed terminate keeps the entry.
+    state.bootstrap.remove_instance(&vm.id);
+    tracing::info!(tenant = %client.name, vm = %vm.id, "vm deleted");
+    Ok(StatusCode::ACCEPTED)
 }
