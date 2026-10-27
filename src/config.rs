@@ -64,9 +64,18 @@ impl VmConfig {
             instance_types.contains(&default_instance_type),
             "DEFAULT_INSTANCE_TYPE {default_instance_type:?} is not in INSTANCE_TYPES"
         );
+        // A launch with SEV-SNP fails in a region without it.
+        let aws_region = var("AWS_REGION", "us-east-2");
+        let sev: Vec<&String> = instance_types.iter().filter(|t| ec2::sev_snp(t)).collect();
+        ensure!(
+            sev.is_empty() || ec2::SEV_SNP_REGIONS.contains(&aws_region.as_str()),
+            "INSTANCE_TYPES has {sev:?}, which launch with AMD SEV-SNP, but AWS has SEV-SNP \
+             only in {:?}, not in AWS_REGION {aws_region:?}",
+            ec2::SEV_SNP_REGIONS
+        );
         Ok(Self {
             public_url: public_url_base(&public_url)?,
-            aws_region: var("AWS_REGION", "us-east-2"),
+            aws_region,
             ami_name: var("AMI_NAME", "ubuntu-24.04-jan3-dev-env-v3"),
             instance_types,
             default_instance_type,
@@ -263,6 +272,33 @@ mod tests {
             let vars = [("INSTANCE_TYPES", list), ("DEFAULT_INSTANCE_TYPE", default)];
             assert!(load(&vars).is_err(), "{list:?}");
         }
+    }
+
+    #[test]
+    fn sev_snp_types_need_a_region_with_sev_snp() {
+        let vars = [
+            ("AWS_REGION", "us-west-2"),
+            ("INSTANCE_TYPES", "t3a.medium,c6a.large"),
+        ];
+        let err = load(&vars)
+            .err()
+            .expect("us-west-2 has no SEV-SNP")
+            .to_string();
+        assert!(
+            err.contains("c6a.large") && err.contains("us-west-2"),
+            "{err}"
+        );
+        // Other types, and sizes without SEV-SNP, launch in any region.
+        let vars = [
+            ("AWS_REGION", "us-west-2"),
+            ("INSTANCE_TYPES", "t3a.medium,m6a.12xlarge"),
+        ];
+        assert!(load(&vars).is_ok());
+        let vars = [
+            ("AWS_REGION", "eu-west-1"),
+            ("INSTANCE_TYPES", "t3a.medium,c6a.large"),
+        ];
+        assert!(load(&vars).is_ok());
     }
 
     #[test]
