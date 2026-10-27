@@ -15,12 +15,10 @@ use crate::{
     error::AppError,
 };
 
-/// The longest that the tag call runs. It runs after the answer, so a VM never waits for it.
+/// The longest that the tag call runs.
 const TAG_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `POST /v1/bootstrap`: a new VM redeems its token. No tenant key. A repeat from the same
-/// address within the grace time of the store gets the same payload, for a VM whose first
-/// answer got lost.
+/// `POST /v1/bootstrap`: a new VM redeems its token. No tenant key. 
 pub async fn redeem(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -50,9 +48,7 @@ pub async fn redeem(
     }
 }
 
-/// The caller: the last `X-Forwarded-For` entry, which Caddy sets. The service listens on
-/// localhost only (compose.yaml), so every outside request comes through Caddy. `unknown`
-/// without a valid entry, as for a local call.
+/// The caller: the last `X-Forwarded-For` entry, which Caddy sets.
 fn caller_address(headers: &HeaderMap) -> String {
     (headers.get("x-forwarded-for"))
         .and_then(|v| v.to_str().ok())
@@ -62,8 +58,6 @@ fn caller_address(headers: &HeaderMap) -> String {
 }
 
 /// Sets the tag `fabrium:setup=delivered`. It only logs: the VM has its payload already.
-/// ponytail: a failed tag leaves a delivered VM showing `expired`. Retry the tag from the
-/// list if that matters.
 async fn mark_delivered(ec2: Arc<dyn Ec2>, instance: String) {
     match tokio::time::timeout(TAG_TIMEOUT, ec2.mark_setup_delivered(&instance)).await {
         Ok(Ok(())) => {}
