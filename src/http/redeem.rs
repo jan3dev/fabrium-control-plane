@@ -12,7 +12,8 @@ use crate::{AppState, auth::bearer_token, bootstrap::Payload, ec2::Ec2, error::A
 /// The longest that the tag call runs. It runs after the answer, so a VM never waits for it.
 const TAG_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `POST /v1/bootstrap`: a new VM redeems its single-use token. No tenant key.
+/// `POST /v1/bootstrap`: a new VM redeems its token. No tenant key. A repeat within the grace
+/// time of the store gets the same payload, for a VM whose first answer got lost.
 pub async fn redeem(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -24,9 +25,9 @@ pub async fn redeem(
         .ok_or(AppError::NotFound)?;
     let (payload, instance) = state.bootstrap.redeem(token).ok_or(AppError::NotFound)?;
 
-    // The entry is gone, so the payload must reach the VM whatever the tag does. The tag
-    // call runs in a task of its own: the answer does not wait for it, and a VM that closes
-    // its connection cannot cancel it.
+    // The payload must reach the VM whatever the tag does. The tag call runs in a task of
+    // its own: the answer does not wait for it, and a VM that closes its connection cannot
+    // cancel it.
     tracing::info!(vm = %instance, "bootstrap payload delivered");
     tokio::spawn(mark_delivered(state.ec2.clone(), instance).in_current_span());
     Ok(Json(payload))
