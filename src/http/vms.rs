@@ -85,9 +85,7 @@ impl Vm {
     }
 }
 
-/// The isolation rule. The tenant tag is checked here, never left to a filter of the port,
-/// so a VM of another tenant, a VM that Fabrium did not launch, and a terminated VM are
-/// all invisible.
+/// Enforces tenant isolation, hiding VMs from other tenants, unmanaged VMs, and terminated VMs.
 pub fn visible(instance: &Instance, tenant: &str) -> bool {
     instance.tenant.as_deref() == Some(tenant) && instance.state != "terminated"
 }
@@ -129,8 +127,7 @@ async fn find(state: &AppState, tenant: &str, id: &str) -> Result<Instance, AppE
         .ok_or(AppError::NotFound)
 }
 
-/// `POST` route that applies `action` to the VM of the path. EC2 would accept more states
-/// than the API does, so the state table is checked here.
+/// `POST` route that applies `action` to the VM of the path. 
 pub fn action(action: Action) -> MethodRouter<AppState> {
     post(
         move |state: State<AppState>,
