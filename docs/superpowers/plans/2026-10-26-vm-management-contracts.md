@@ -34,7 +34,7 @@ Every error body is `{"error":"<short message>"}`. A `413` from the body limit c
 | `state` | The EC2 state name: `pending`, `running`, `stopping`, `stopped`, or `shutting-down`. `terminated` never appears. |
 | `public_ip` | A string, or `null`. |
 | `launched_at` | EC2 `LaunchTime`, RFC 3339, UTC, whole seconds. EC2 resets it at each start. |
-| `setup` | `delivered` if the instance has the tag `fabrium:setup=delivered`. Otherwise `pending` if the bootstrap store has a live entry for the instance that no VM has redeemed. Otherwise `expired`. |
+| `setup` | `delivered` if the instance has the tag `fabrium:setup=delivered`. Otherwise `pending` if the bootstrap store has a live entry for the instance: not redeemed yet, or in its 60 s of grace after the first redeem, while the tag may not show yet. Otherwise `expired`. |
 
 The `setup` rule refines the 15-minute rule of the spec. A store entry lives 15 minutes, so the result is the same. After a restart of the control plane, a VM that did not redeem its token shows `expired` at once, which is correct: its payload is gone.
 
@@ -102,8 +102,8 @@ An `{id}` that is not of the form `^i-[0-9a-f]{8,17}$`, a VM of another tenant, 
 
 - `POST /v1/bootstrap` with `Authorization: Bearer <bootstrap token>`. No tenant key.
 - `200`: the `bootstrap` object of the create request, as JSON.
-- `404 {"error":"not found"}`: a token that is unknown or expired, or a repeat after the grace time.
-- A repeat within 60 s of the first redeem gets the same payload, for a VM whose first answer got lost. The 15-minute TTL still ends it. The stub keeps a body only when curl finishes it.
+- `404 {"error":"not found"}`: a token that is unknown or expired, a repeat after the grace time, or a repeat from another address.
+- A repeat within 60 s of the first redeem, from the same address, gets the same payload, for a VM whose first answer got lost. The 15-minute TTL still ends it. The address is the last `X-Forwarded-For` entry, which Caddy sets. A repeat from another address is logged as a warning with both addresses. The stub keeps a body only when curl finishes it.
 
 ## 2. zooid browser API (web to zooid)
 
@@ -151,6 +151,8 @@ An `{id}` that is not of the form `^i-[0-9a-f]{8,17}$`, a VM of another tenant, 
 | `github_token` | Optional. An empty string is the same as absent. |
 
 An admission step that fails gives `502 {"error":"<message>","step":"<step>"}`. `step` is one of `bundle`, `register_appservice`, `whoami`, `register_user`, `join`, `roster`. A retry with the same body continues from the step that failed.
+
+With `new`, zooid reads the VM list before the admission: a VM with that name gives `409 {"error":"name in use"}` before any write, so the admission cannot rewrite the roster entry of a VM's live agent.
 
 ## 3. Bootstrap payload (zooid builds it, the control plane holds it, the VM runs it)
 

@@ -68,7 +68,7 @@ Every route except `/health` and `/v1/bootstrap` needs `Authorization: Bearer <t
 | `POST /v1/vms/{id}/stop` | None | `202 {vm}` |
 | `POST /v1/vms/{id}/reboot` | None | `202 {vm}` |
 | `DELETE /v1/vms/{id}` | None | `202` |
-| `POST /v1/bootstrap` | `Authorization: Bearer <bootstrap token>` | `200 {files, script}` once, then `404` |
+| `POST /v1/bootstrap` | `Authorization: Bearer <bootstrap token>` | `200 {files, script}`, again only from the same address within 60 s, then `404` |
 
 ### Rules
 
@@ -87,7 +87,7 @@ Every route except `/health` and `/v1/bootstrap` needs `Authorization: Bearer <t
 ### Bootstrap
 
 - The token is 32 random bytes, base64url. The store keeps only the SHA-256 hash of the token, with the payload, the instance ID, and the expiry (15 minutes).
-- A redeem removes the entry, sets the `fabrium:setup` tag, and returns the payload. A second redeem gives `404`.
+- A redeem returns the payload and then sets the `fabrium:setup` tag. The entry stays 60 s more, for a repeat from the same address: a VM whose first answer got lost asks again. A repeat from another address gives `404` and a warning in the log with both addresses. After the 60 s, every redeem gives `404`.
 - A delete removes the entry of that VM, if it is still there.
 - The store is in memory. `ponytail:` a restart loses the payloads that are not redeemed; those VMs show `expired` and must be created again. Persist the store only if restarts during launches become frequent.
 - Logs never contain tokens, payloads, or file contents.
@@ -263,7 +263,7 @@ The control plane keeps its request timeout of 10 seconds. EC2 calls return in s
 
 ## Security notes
 
-- The bootstrap token stays in the user data until the VM redeems it, 15 minutes or less. A PowerUser can read it there. Because the token works once, a theft is visible: the redeem of the real VM gets `404`, its agent never comes online, and `/var/log/fabrium-bootstrap.log` on the VM shows the failure. The list shows `delivered`, because the redeem of the thief set the tag.
+- The bootstrap token stays in the user data until the VM redeems it, 15 minutes or less. A PowerUser can read it there. Only the first caller gets the payload, again only from its address, so a theft is visible: if the thief redeems first, the redeem of the real VM gets `404`, its agent never comes online, and `/var/log/fabrium-bootstrap.log` on the VM shows the failure. The list shows `delivered`, because the redeem of the thief set the tag. If the thief comes after the VM, the control plane refuses it and logs a warning with both addresses.
 - v1 does not protect against insiders of the AWS account. A PowerUser can also make a snapshot of a disk.
 - Secrets on the VM: `~/zooid/.env` (the AS token of the VM) and `~/zooid/secrets.env` (Haven and GitHub), mode 600. The agent can read them. "Security" in `deploy/README.md` accepts this.
 - Types without SEV-SNP are allowed, and the UI marks them. `fabrium/docs/tech/create-vm-from-image.md` advises against secrets on them.
