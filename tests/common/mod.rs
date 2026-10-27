@@ -163,6 +163,24 @@ pub async fn redeem(h: &Harness, token: &str) -> (StatusCode, Value) {
     call(&h.app, "POST", "/v1/bootstrap", Some(&auth)).await
 }
 
+/// `POST /v1/bootstrap` as Caddy forwards it, with `X-Forwarded-For: <forwarded_for>`.
+pub async fn redeem_from(h: &Harness, token: &str, forwarded_for: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/bootstrap")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header("x-forwarded-for", forwarded_for)
+        .body(Body::empty())
+        .unwrap();
+    let res = h.app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 /// An instance of tenant `stage` with a known launch time.
 pub fn stage_vm(id: &str, name: &str, state: &str, instance_type: &str) -> Instance {
     fake::instance(id, name, Some("stage"), state, instance_type)

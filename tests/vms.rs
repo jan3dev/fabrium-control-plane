@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use common::*;
 use fabrium_control_plane::{
-    bootstrap::{Store, TTL},
+    bootstrap::{Redeemed, Store, TTL},
     ec2::{Action, Instance, fake},
 };
 use serde_json::{Value, json};
@@ -337,7 +337,7 @@ async fn delete_drops_the_pending_payload() {
     let (status, _) = call_raw(&h.app, "DELETE", &format!("/v1/vms/{ID}"), Some(STAGE)).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert!(!h.state.bootstrap.has_live(ID));
-    assert!(h.state.bootstrap.redeem("token").is_none());
+    assert!(h.state.bootstrap.redeem("token", "unknown").is_none());
 }
 
 #[tokio::test]
@@ -657,7 +657,10 @@ async fn user_data_holds_the_stub_and_the_store_holds_the_payload() {
     assert!(script.starts_with("#!/bin/bash\n"));
     assert!(script.contains("\nURL='https://cp.example.org/v1/bootstrap'\n"));
     let token = token_in(user_data);
-    let (payload, instance) = h.state.bootstrap.redeem(&token).expect("the token redeems");
+    let Some(Redeemed::Payload(payload, instance)) = h.state.bootstrap.redeem(&token, "unknown")
+    else {
+        panic!("the token redeems");
+    };
     assert_eq!(vm["id"], json!(instance));
     assert_eq!(
         serde_json::to_value(&payload).unwrap(),
@@ -856,6 +859,31 @@ async fn payload_round_trips_awkward_content() {
 }
 
 #[tokio::test]
+async fn a_repeat_redeem_from_another_address_is_refused() {
+    let h = harness().await;
+    create(&h.app, STAGE, &create_body("lima")).await;
+    let token = token_in(&h.fake.launches()[0].user_data);
+    let vm = "203.0.113.10";
+    assert_eq!(redeem_from(&h, &token, vm).await.0, StatusCode::OK);
+    // Caddy adds the real address last. A value that the caller sent comes first and does
+    // not count.
+    for other in ["198.51.100.7", "203.0.113.10, 198.51.100.7"] {
+        let (status, body) = redeem_from(&h, &token, other).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::NOT_FOUND, not_found()),
+            "{other}"
+        );
+    }
+    // The VM can still ask again.
+    let (status, body) = redeem_from(&h, &token, &format!("198.51.100.7, {vm}")).await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::OK, create_body("lima")["bootstrap"].clone())
+    );
+}
+
+#[tokio::test]
 async fn redeem_still_delivers_when_tagging_fails() {
     let h = harness().await;
     let (_, vm) = create(&h.app, STAGE, &create_body("lima")).await;
@@ -866,6 +894,9 @@ async fn redeem_still_delivers_when_tagging_fails() {
     assert_eq!(body, create_body("lima")["bootstrap"]);
     // A repeat within the grace time gets the payload again, and the VM is still not marked.
     settle().await; // the failed tag call runs after the answer
+    // In the grace time, the VM shows `pending`, not `expired`, while its tag is missing.
+    let (_, listed) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
+    assert_eq!(listed[0]["setup"], "pending");
     assert_eq!(redeem(&h, &token).await.0, StatusCode::OK);
     settle().await;
     assert!(

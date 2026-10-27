@@ -59,6 +59,8 @@ async fn logs_never_hold_a_token_a_key_or_the_payload() {
     h.fake.fail_tagging(true);
     redeem(&h, &token).await;
     settle().await; // the tag call runs after the answer
+    // A repeat from another address is refused, and logged with that address.
+    redeem_from(&h, &token, "198.51.100.7").await;
     h.fake.fail(true);
     create(&h.app, STAGE, &create_body("other")).await;
     call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
@@ -84,6 +86,8 @@ async fn logs_never_hold_a_token_a_key_or_the_payload() {
         "aws request failed",
         "vm deleted",
         "timed out",
+        "refused a repeat redeem from another address",
+        "198.51.100.7",
     ];
     for line in lines {
         assert!(logs.contains(line), "no {line:?} in the log:\n{logs}");

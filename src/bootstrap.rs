@@ -107,8 +107,17 @@ pub struct Store {
 }
 
 /// How long a redeemed payload stays, so that a VM whose first answer got lost can ask
-/// again. The TTL still ends it.
+/// again from the same address. The TTL still ends it.
 pub const GRACE: Duration = Duration::from_secs(60);
+
+/// What a redeem of a live token gets. No `Debug`: the payload holds secrets.
+pub enum Redeemed {
+    /// The payload and its instance.
+    Payload(Payload, String),
+    /// A repeat from another address than the first redeem: the instance and that first
+    /// address. Only the caller of the first redeem, the VM, gets the payload again.
+    Refused { instance: String, first: String },
+}
 
 struct Entry {
     payload: Payload,
@@ -118,14 +127,14 @@ struct Entry {
     tenant: String,
     name: String,
     expires: Instant,
-    /// The first redeem.
-    redeemed: Option<Instant>,
+    /// The time and the caller address of the first redeem.
+    redeemed: Option<(Instant, String)>,
 }
 
 impl Entry {
     /// The TTL, or the end of the grace time after the first redeem if that comes first.
     fn end(&self, grace: Duration) -> Instant {
-        (self.redeemed).map_or(self.expires, |at| self.expires.min(at + grace))
+        (self.redeemed.as_ref()).map_or(self.expires, |(at, _)| self.expires.min(*at + grace))
     }
 }
 
@@ -171,20 +180,31 @@ impl Store {
         self.live().insert(hash(token), entry);
     }
 
-    /// The payload and its instance. A repeat within the grace time gets the same payload,
-    /// so a lost answer does not strand the VM. `None` if the token is unknown or its entry
-    /// has ended.
-    pub fn redeem(&self, token: &str) -> Option<(Payload, String)> {
+    /// Redeems `token` for the caller at address `from`. A repeat from the same address within
+    /// the grace time gets the same payload, so a lost answer does not strand the VM. A repeat
+    /// from another address is refused: a token that leaked does not give the payload away
+    /// unseen. `None` if the token is unknown or its entry has ended.
+    pub fn redeem(&self, token: &str, from: &str) -> Option<Redeemed> {
         // `live` has dropped an entry whose TTL or grace time is over.
         let mut entries = self.live();
         let entry = entries.get_mut(&hash(token))?;
-        entry.redeemed.get_or_insert_with(Instant::now);
-        Some((entry.payload.clone(), entry.instance.clone()))
+        if let Some((_, first)) = &entry.redeemed
+            && first != from
+        {
+            let (instance, first) = (entry.instance.clone(), first.clone());
+            return Some(Redeemed::Refused { instance, first });
+        }
+        (entry.redeemed).get_or_insert_with(|| (Instant::now(), from.to_owned()));
+        Some(Redeemed::Payload(
+            entry.payload.clone(),
+            entry.instance.clone(),
+        ))
     }
 
-    /// True if the instance has an entry that no VM has redeemed and that has not expired.
+    /// True if the instance has a live entry: a token that no VM has redeemed, or one in its
+    /// grace time. In the grace time, the tag `fabrium:setup=delivered` may not show yet.
     pub fn has_live(&self, instance: &str) -> bool {
-        (self.live().values()).any(|e| e.instance == instance && e.redeemed.is_none())
+        (self.live().values()).any(|e| e.instance == instance)
     }
 
     /// True if a VM of the tenant with this name is still waiting for its token.
@@ -200,6 +220,17 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The address of the VM.
+    const VM: &str = "203.0.113.10";
+
+    /// A redeem from the VM: the payload and the instance, or `None`.
+    fn get(store: &Store, token: &str) -> Option<(Payload, String)> {
+        match store.redeem(token, VM)? {
+            Redeemed::Payload(payload, instance) => Some((payload, instance)),
+            Redeemed::Refused { .. } => None,
+        }
+    }
 
     fn file(path: &str, mode: &str, owner: &str) -> File {
         File {
@@ -241,21 +272,36 @@ mod tests {
     fn a_repeat_within_the_grace_time_gets_the_same_payload() {
         let store = Store::new(TTL);
         store.insert("tok", payload(), "i-1", "stage", "lima");
-        let (got, instance) = store.redeem("tok").unwrap();
+        let (got, instance) = get(&store, "tok").unwrap();
         assert!(got == payload());
         assert_eq!(instance, "i-1");
         // The first answer got lost on its way: the VM asks again.
-        let (again, instance) = store.redeem("tok").unwrap();
+        let (again, instance) = get(&store, "tok").unwrap();
         assert!(again == payload());
         assert_eq!(instance, "i-1");
+    }
+
+    #[test]
+    fn a_repeat_from_another_address_is_refused() {
+        let store = Store::new(TTL);
+        store.insert("tok", payload(), "i-1", "stage", "lima");
+        assert!(get(&store, "tok").is_some());
+        // The token leaked: someone else asks within the grace time.
+        let Some(Redeemed::Refused { instance, first }) = store.redeem("tok", "198.51.100.7")
+        else {
+            panic!("a repeat from another address must be refused");
+        };
+        assert_eq!((instance.as_str(), first.as_str()), ("i-1", VM));
+        // The VM itself can still ask again.
+        assert!(get(&store, "tok").is_some());
     }
 
     #[test]
     fn a_repeat_after_the_grace_time_is_refused() {
         let store = Store::new(TTL).with_grace(Duration::ZERO);
         store.insert("tok", payload(), "i-1", "stage", "lima");
-        assert!(store.redeem("tok").is_some());
-        assert!(store.redeem("tok").is_none());
+        assert!(get(&store, "tok").is_some());
+        assert!(get(&store, "tok").is_none());
         // The entry is gone, not only refused.
         assert!(store.entries().is_empty());
     }
@@ -264,9 +310,9 @@ mod tests {
     fn the_grace_time_ends_with_the_ttl() {
         let store = Store::new(Duration::from_millis(200));
         store.insert("tok", payload(), "i-1", "stage", "lima");
-        assert!(store.redeem("tok").is_some());
+        assert!(get(&store, "tok").is_some());
         std::thread::sleep(Duration::from_millis(250));
-        assert!(store.redeem("tok").is_none());
+        assert!(get(&store, "tok").is_none());
     }
 
     #[test]
@@ -274,7 +320,7 @@ mod tests {
         // The payload holds secrets: it must not stay after its grace time.
         let store = Store::new(TTL).with_grace(Duration::ZERO);
         store.insert("a", payload(), "i-1", "stage", "lima");
-        store.redeem("a").unwrap();
+        get(&store, "a").unwrap();
         assert!(!store.has_live("i-1"));
         assert_eq!(store.entries().len(), 0);
     }
@@ -283,10 +329,10 @@ mod tests {
     fn unknown_token_does_not_redeem() {
         let store = Store::new(TTL);
         store.insert("tok", payload(), "i-1", "stage", "lima");
-        assert!(store.redeem("other").is_none());
-        assert!(store.redeem("").is_none());
+        assert!(get(&store, "other").is_none());
+        assert!(get(&store, "").is_none());
         // A wrong guess does not burn the real token.
-        assert!(store.redeem("tok").is_some());
+        assert!(get(&store, "tok").is_some());
     }
 
     #[test]
@@ -294,7 +340,7 @@ mod tests {
         let store = Store::new(Duration::ZERO);
         store.insert("tok", payload(), "i-1", "stage", "lima");
         assert!(!store.has_live("i-1"));
-        assert!(store.redeem("tok").is_none());
+        assert!(get(&store, "tok").is_none());
     }
 
     #[test]
@@ -304,14 +350,15 @@ mod tests {
         store.insert("tok", payload(), "i-1", "stage", "lima");
         assert!(store.has_live("i-1"));
         assert!(!store.has_live("i-2"));
-        store.redeem("tok").unwrap();
-        assert!(!store.has_live("i-1"));
+        get(&store, "tok").unwrap();
+        // In the grace time, the tag may not show yet: the VM is still `pending`.
+        assert!(store.has_live("i-1"));
 
         store.insert("tok2", payload(), "i-1", "stage", "lima");
         store.insert("tok3", payload(), "i-2", "stage", "other");
         store.remove_instance("i-1");
         assert!(!store.has_live("i-1"));
-        assert!(store.redeem("tok2").is_none());
+        assert!(get(&store, "tok2").is_none());
         assert!(store.has_live("i-2"));
     }
 
@@ -325,7 +372,7 @@ mod tests {
         assert!(!store.name_in_use("prod", "lima"));
         assert!(!store.name_in_use("stage", "other"));
         // A VM that redeemed its token, or was deleted, is known to EC2 or gone.
-        store.redeem("tok").unwrap();
+        get(&store, "tok").unwrap();
         assert!(!store.name_in_use("stage", "lima"));
         store.insert("tok2", payload(), "i-2", "stage", "other");
         store.remove_instance("i-2");
@@ -350,7 +397,7 @@ mod tests {
         assert_eq!(store.entries().len(), 0, "has_live");
 
         store.insert("b", payload(), "i-2", "stage", "other");
-        assert!(store.redeem("unknown").is_none());
+        assert!(get(&store, "unknown").is_none());
         assert_eq!(store.entries().len(), 0, "redeem of another token");
 
         store.insert("c", payload(), "i-3", "stage", "third");
