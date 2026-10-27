@@ -57,7 +57,7 @@ The database lives in the `data` Docker volume. It survives restarts.
 |----------|---------|--------------|-------|
 | `API_KEYS` | none (required) | from `.env` | Comma-separated `<tenant>:<sha256-hex>` pairs. A tenant name uses only `a-z`, `0-9`, and `-`, because it becomes the value of the `fabrium:tenant` tag. The service refuses to start if the variable is missing, empty, or malformed, if a name is not valid, or if two entries share a name or a hash. |
 | `PUBLIC_URL` | none (required) | from `.env` | The base URL that VMs use to redeem their token. It must start with `https://` and must not hold a quote or a space. The service removes a trailing `/`. |
-| `AWS_REGION` | `us-east-2` | from `.env` | |
+| `AWS_REGION` | `us-east-2` | from `.env` | AWS has SEV-SNP on shared tenancy only in `us-east-2` and `eu-west-1`. In another region, the service refuses to start if `INSTANCE_TYPES` has a SEV-SNP type. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | none | from `.env` | The AWS SDK reads them from the environment. Temporary credentials expire. Put new ones in `.env` and recreate the container. |
 | `AMI_NAME` | `ubuntu-24.04-jan3-dev-env-v3` | from `.env` | The VM image. The service uses the newest available image that the account owns with this name and with the tag `Project=jan3-dev-env`. |
 | `INSTANCE_TYPES` | `t3a.medium,t3a.large,t3.medium,t3.large,m6a.large,c6a.large,r6a.large` | from `.env` | The allowlist, in the order that the API shows it. Each entry is `<family>.<size>`. The family is `t3`, `t3a`, `c6a`, `m6a`, or `r6a`. The service refuses to start with another family or with a duplicate. |
@@ -135,8 +135,8 @@ A VM:
 - `state` is the EC2 state name: `pending`, `running`, `stopping`, `stopped`, or `shutting-down`. The API never shows `terminated`.
 - `public_ip` is a string, or `null`.
 - `launched_at` is the EC2 launch time in UTC, in whole seconds. EC2 resets it at each start.
-- `sev_snp` is `true` for the families `c6a`, `m6a`, and `r6a`. The service enables AMD SEV-SNP for exactly those.
-- `setup` is `delivered` if the VM redeemed its token, `pending` if its token can still be redeemed, and `expired` if not. An `expired` VM never got its payload. Delete it and create it again.
+- `sev_snp` is `true` for the sizes that AWS launches with AMD SEV-SNP: `c6a.large` to `c6a.16xlarge`, `m6a.large` to `m6a.8xlarge`, and `r6a.large` to `r6a.4xlarge`. The service enables SEV-SNP for exactly those. A larger size of these families launches without it.
+- `setup` is `delivered` if the VM has the tag of a redeemed token, `pending` while its token is live (not redeemed yet, or in the 60 s after the first redeem, before the tag shows), and `expired` if not. An `expired` VM never got its payload. Delete it and create it again.
 
 An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and are cached after the first success.
 
@@ -188,9 +188,11 @@ A failed AWS call gives `502 {"error":"aws request failed"}`. The AWS detail goe
 
 ### Bootstrap
 
-The user data of a new VM is a short script with the public URL and a single-use token. The token is 32 random bytes in base64url. The service keeps only its SHA-256, with the payload, in memory for 15 minutes.
+The user data of a new VM is a short script with the public URL and a token. The token is 32 random bytes in base64url. The service keeps only its SHA-256, with the payload, in memory for 15 minutes.
 
-The VM sends `POST /v1/bootstrap` with `Authorization: Bearer <token>`. The service removes the entry, sets the tag `fabrium:setup=delivered` on the instance, and returns the payload. A second try, an unknown token, an expired token, and a missing header all give `404 {"error":"not found"}`. A failed or slow tag (5 s limit) is logged, and the VM still gets its payload. The token is not a tenant API key, and a tenant API key is not a token.
+The VM sends `POST /v1/bootstrap` with `Authorization: Bearer <token>`. The service returns the payload, then sets the tag `fabrium:setup=delivered` on the instance. A failed or slow tag (5 s limit) is logged, and the VM still gets its payload.
+
+For 60 s after the first redeem, a repeat from the same address gets the same payload, so a VM whose first answer got lost can ask again. The address is the last `X-Forwarded-For` entry, which Caddy sets: the service listens on localhost only. A repeat from another address gets `404`, and the service logs a warning with both addresses: the token reached someone else than the VM. An unknown token, an expired token, a token after its 60 s, and a missing header also give `404 {"error":"not found"}`. The token is not a tenant API key, and a tenant API key is not a token.
 
 A restart of the service loses the payloads that no VM redeemed yet. Those VMs show `expired`.
 
