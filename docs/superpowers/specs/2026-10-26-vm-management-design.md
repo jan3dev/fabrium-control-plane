@@ -412,15 +412,21 @@ umask 077
 URL='<PUBLIC_URL>/v1/bootstrap'
 TOKEN='<TOKEN>'
 PAYLOAD=/run/fabrium-bootstrap.json
+# The payload and the setup script hold secrets. Whatever happens, they do not stay in /run.
+trap 'rm -f "$PAYLOAD" "$PAYLOAD.part" /run/fabrium-setup.sh' EXIT
 
 deadline=$((SECONDS + 600))
 while [ "$SECONDS" -lt "$deadline" ]; do
+  # A cut answer leaves part of a body: keep only a whole one. For a short time, the
+  # control plane answers a repeat with the same payload.
   if printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" |
-    curl -fsS -K - --max-time 20 -X POST -o "$PAYLOAD" "$URL"; then
+    curl -fsS -K - --max-time 20 -X POST -o "$PAYLOAD.part" "$URL"; then
+    mv "$PAYLOAD.part" "$PAYLOAD"
     break
   fi
   sleep 10
 done
+rm -f "$PAYLOAD.part"
 [ -s "$PAYLOAD" ] || { echo "bootstrap: no payload"; exit 1; }
 
 count="$(jq '.files | length' "$PAYLOAD")"
@@ -433,11 +439,11 @@ for i in $(seq 0 $((count - 1))); do
     sudo -u "$owner" mkdir -p -m 700 "$(dirname "$path")"
   fi
   jq -j ".files[$i].content" "$PAYLOAD" >"$path"
-  chmod "$(jq -r ".files[$i].mode" "$PAYLOAD")" "$path"
+  # chown clears the setuid and setgid bits, so the mode comes last.
   chown "$owner:" "$path"
+  chmod "$(jq -r ".files[$i].mode" "$PAYLOAD")" "$path"
 done
 
 jq -r '.script' "$PAYLOAD" >/run/fabrium-setup.sh
 bash /run/fabrium-setup.sh
-rm -f "$PAYLOAD" /run/fabrium-setup.sh
 ```
