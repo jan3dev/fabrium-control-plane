@@ -572,8 +572,7 @@ async fn name_check_is_per_tenant_and_ignores_terminated_vms() {
         );
     }
     assert!(h.fake.launches().is_empty());
-    // Another tenant may use the name. So may a stage VM when only a terminated VM, a VM of
-    // another tenant, or a VM without a tenant has it.
+    // The name stays free for another tenant, and where only a terminated, foreign, or untagged VM has it.
     for (auth, name) in [
         (PROD, "lima"),
         (STAGE, "old"),
@@ -694,9 +693,7 @@ async fn create_is_502_and_launches_nothing_when_aws_fails() {
 #[tokio::test]
 async fn a_create_that_times_out_still_stores_its_payload() {
     let h = harness().await;
-    // EC2 accepts RunInstances at once and answers 6 s later. The second create waits 6 s
-    // for the lock, then its answer takes 6 s more, so the 10 s request timeout drops it
-    // in the middle of the launch.
+    // RunInstances answers in 6 s: the second create waits for the lock, then times out mid-launch.
     h.fake.delay_launch(Duration::from_secs(6));
     tokio::time::pause(); // after the database is up
     let (a, b) = (create_body("a"), create_body("b"));
@@ -710,8 +707,7 @@ async fn a_create_that_times_out_still_stores_its_payload() {
     // Let the work that the timeout left behind finish.
     tokio::time::sleep(Duration::from_secs(30)).await;
 
-    // Every VM that EC2 accepted has its payload. Else the VM would boot with nothing
-    // to redeem, and its name would stay in use.
+    // Every VM that EC2 accepted has its payload: else it boots with nothing and holds its name.
     let launched = h.fake.instances();
     assert_eq!(launched.len(), 2);
     for instance in &launched {
@@ -865,8 +861,7 @@ async fn a_repeat_redeem_from_another_address_is_refused() {
     let token = token_in(&h.fake.launches()[0].user_data);
     let vm = "203.0.113.10";
     assert_eq!(redeem_from(&h, &token, vm).await.0, StatusCode::OK);
-    // Caddy adds the real address last. A value that the caller sent comes first and does
-    // not count.
+    // Caddy appends the real address: an earlier entry, which the caller sent, does not count.
     for other in ["198.51.100.7", "203.0.113.10, 198.51.100.7"] {
         let (status, body) = redeem_from(&h, &token, other).await;
         assert_eq!(

@@ -180,10 +180,9 @@ impl Store {
         self.live().insert(hash(token), entry);
     }
 
-    /// Redeems `token` for the caller at address `from`. A repeat from the same address within
-    /// the grace time gets the same payload, so a lost answer does not strand the VM. A repeat
-    /// from another address is refused: a token that leaked does not give the payload away
-    /// unseen. `None` if the token is unknown or its entry has ended.
+    /// Redeems `token` for the caller at `from`. In the grace time, a repeat from the same address
+    /// gets the same payload, and a repeat from another address is refused (README, "Bootstrap").
+    /// `None` if the token is unknown or its entry has ended.
     pub fn redeem(&self, token: &str, from: &str) -> Option<Redeemed> {
         // `live` has dropped an entry whose TTL or grace time is over.
         let mut entries = self.live();
@@ -388,8 +387,7 @@ mod tests {
 
     #[test]
     fn every_read_drops_the_expired_entries() {
-        // With a zero TTL, an entry is expired the moment it exists. The payload holds
-        // secrets, so it must not stay in memory until the next insert.
+        // A zero TTL expires the entry at once: its secrets must not wait for the next insert.
         let store = Store::new(Duration::ZERO);
         store.insert("a", payload(), "i-1", "stage", "lima");
         assert_eq!(store.entries().len(), 1);

@@ -171,6 +171,8 @@ An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and 
 
 A body larger than 256 KiB gives `413`. If a VM of the same tenant that is not terminated has the name, the result is `409 {"error":"name in use"}`. A VM of another tenant, or a terminated VM, does not count. A VM that still waits for its token also holds its name, even if EC2 does not list it yet. A VM that you delete keeps its name until EC2 reports it as `terminated`, usually after about a minute, so a create with the same name right after a delete can give `409`.
 
+Creates run one at a time: one lock, held across the AWS calls (about 3 s), stops two requests with one name from both passing the name check. A create also runs in a task of its own, so the 10 s request timeout cannot separate the launch from the insert of the payload: a VM that EC2 accepted always has its payload, and never holds its name without one. The task keeps the lock until it ends, and the SDK timeouts bound that time. To run creates in parallel, use a lock per tenant and name. With more than one control plane instance, the lock must be shared.
+
 ### Actions
 
 | Action | Allowed state | The `202` shows |

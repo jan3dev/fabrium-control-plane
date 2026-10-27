@@ -211,17 +211,11 @@ pub async fn create(
         .validate()
         .map_err(|e| AppError::BadRequest(e.to_owned()))?;
 
-    // ponytail: one lock for every create, held across the AWS calls (about 3 s). It stops
-    // two requests with one name from both passing the check. Use a lock per tenant and
-    // name if creates must run in parallel. With more than one control plane instance it
-    // needs a shared lock.
+    // ponytail: one create at a time (README, "Create a VM"); a lock per tenant and name scales.
     let guard = state.create_lock.clone().lock_owned().await;
     let tenant = client.name.clone();
     let instance_type = instance_type.to_owned();
-    // The request timeout (10 s) drops this handler at its next await. The task is not
-    // dropped with it, so the launch and the insert of the payload stay together. Else a VM
-    // that EC2 accepted could have no payload, and its name would stay in use. The task
-    // keeps the lock until it ends. The SDK timeouts bound that time.
+    // A task of its own: the 10 s request timeout must not split the launch from the payload.
     let task = tokio::spawn(
         async move {
             let _guard = guard;
@@ -243,9 +237,7 @@ async fn launch_vm(
     request: CreateVm,
     instance_type: &str,
 ) -> Result<Vm, AppError> {
-    // A describe right after `RunInstances` can miss the new VM (EC2 is not read-after-write).
-    // The payload store knows every VM that still waits for its token, so a name that a
-    // recent launch holds counts as in use.
+    // EC2 lists a new VM late, so a name that the payload store holds counts as in use too.
     let listed = (state.ec2.list(tenant).await?)
         .iter()
         .any(|i| visible(i, tenant) && i.name == request.name);

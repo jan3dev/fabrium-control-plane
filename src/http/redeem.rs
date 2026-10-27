@@ -25,8 +25,7 @@ pub async fn redeem(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Payload>, AppError> {
-    // Every failure is the same 404: a missing header, an unknown, used, or expired token, or
-    // a repeat from another address.
+    // Every failure is the same 404: no header, an unknown or ended token, a foreign repeat.
     let token = (headers.get(AUTHORIZATION))
         .and_then(|v| v.to_str().ok())
         .and_then(bearer_token)
@@ -38,9 +37,7 @@ pub async fn redeem(
         .ok_or(AppError::NotFound)?
     {
         Redeemed::Payload(payload, instance) => {
-            // The payload must reach the VM whatever the tag does. The tag call runs in a task
-            // of its own: the answer does not wait for it, and a VM that closes its connection
-            // cannot cancel it.
+            // Own task: the answer skips the wait, and a closed connection cannot cancel the tag.
             tracing::info!(vm = %instance, from = %from, "bootstrap payload delivered");
             tokio::spawn(mark_delivered(state.ec2.clone(), instance).in_current_span());
             Ok(Json(payload))
@@ -65,7 +62,6 @@ fn caller_address(headers: &HeaderMap) -> String {
 }
 
 /// Sets the tag `fabrium:setup=delivered`. It only logs: the VM has its payload already.
-///
 /// ponytail: a failed tag leaves a delivered VM showing `expired`. Retry the tag from the
 /// list if that matters.
 async fn mark_delivered(ec2: Arc<dyn Ec2>, instance: String) {
