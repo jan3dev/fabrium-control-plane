@@ -112,11 +112,13 @@ pub const GRACE: Duration = Duration::from_secs(60);
 
 /// What a redeem of a live token gets. No `Debug`: the payload holds secrets.
 pub enum Redeemed {
-    /// The payload and its instance.
     Payload(Payload, String),
     /// A repeat from another address than the first redeem: the instance and that first
     /// address. Only the caller of the first redeem, the VM, gets the payload again.
-    Refused { instance: String, first: String },
+    Refused {
+        instance: String,
+        first: String,
+    },
 }
 
 struct Entry {
@@ -167,7 +169,6 @@ impl Store {
         entries
     }
 
-    /// Keeps the payload for `ttl`.
     pub fn insert(&self, token: &str, payload: Payload, instance: &str, tenant: &str, name: &str) {
         let entry = Entry {
             payload,
@@ -220,7 +221,6 @@ impl Store {
 mod tests {
     use super::*;
 
-    /// The address of the VM.
     const VM: &str = "203.0.113.10";
 
     /// A redeem from the VM: the payload and the instance, or `None`.

@@ -60,8 +60,7 @@ impl ApiKeys {
     fn find(&self, key: &str) -> Option<&str> {
         let digest = Sha256::digest(key.as_bytes());
         let mut found = None;
-        // Visit every entry so the time does not reveal which one matched.
-        // `parse` keeps digests unique, so at most one entry matches.
+        // Visit every entry (digests are unique) so the time does not reveal which one matched.
         for (name, hash) in &self.0 {
             if bool::from(digest.as_slice().ct_eq(hash)) {
                 found = Some(name.as_str());
