@@ -21,9 +21,33 @@ pub fn family(instance_type: &str) -> Option<&str> {
     (!family.is_empty() && !size.is_empty()).then_some(family)
 }
 
-/// True for the families that have AMD SEV-SNP.
+/// The instance types that AWS launches with AMD SEV-SNP ("AMD SEV-SNP for Amazon EC2
+/// instances" in the EC2 User Guide). Larger sizes of these families have no SEV-SNP.
+const SEV_SNP_TYPES: [&str; 16] = [
+    "c6a.large",
+    "c6a.xlarge",
+    "c6a.2xlarge",
+    "c6a.4xlarge",
+    "c6a.8xlarge",
+    "c6a.12xlarge",
+    "c6a.16xlarge",
+    "m6a.large",
+    "m6a.xlarge",
+    "m6a.2xlarge",
+    "m6a.4xlarge",
+    "m6a.8xlarge",
+    "r6a.large",
+    "r6a.xlarge",
+    "r6a.2xlarge",
+    "r6a.4xlarge",
+];
+
+/// The regions where shared tenancy has AMD SEV-SNP.
+pub const SEV_SNP_REGIONS: [&str; 2] = ["us-east-2", "eu-west-1"];
+
+/// True for the instance types that AWS launches with AMD SEV-SNP.
 pub fn sev_snp(instance_type: &str) -> bool {
-    matches!(family(instance_type), Some("c6a" | "m6a" | "r6a"))
+    SEV_SNP_TYPES.contains(&instance_type)
 }
 
 /// An EC2 instance, reduced to what the API shows.
@@ -117,9 +141,20 @@ mod tests {
     }
 
     #[test]
-    fn sev_snp_is_true_only_for_c6a_m6a_r6a() {
-        for yes in ["c6a.large", "m6a.large", "r6a.xlarge"] {
+    fn sev_snp_is_true_only_for_the_sizes_that_aws_lists() {
+        for yes in [
+            "c6a.large",
+            "c6a.16xlarge",
+            "m6a.large",
+            "m6a.8xlarge",
+            "r6a.xlarge",
+            "r6a.4xlarge",
+        ] {
             assert!(sev_snp(yes), "{yes}");
+        }
+        // Larger sizes of the same families launch without SEV-SNP.
+        for no in ["c6a.24xlarge", "c6a.metal", "m6a.12xlarge", "r6a.8xlarge"] {
+            assert!(!sev_snp(no), "{no}");
         }
         for no in ["t3.medium", "t3a.large", "m6i.large", "c6a", ""] {
             assert!(!sev_snp(no), "{no}");
