@@ -27,7 +27,7 @@ Workspace admins create, list, start, stop, reboot, and delete agent VMs from th
 | Matrix identity | zooid grants it. The control plane never sees Matrix. | zooid already owns the workforce model and the central appservice. |
 | Caller of the control plane | zooid, server to server. The browser never calls the control plane. | The tenant comes from the API key, zooid resolves roles, and Matrix tokens never pass through the browser. |
 | Tenancy | One control plane for all zooid instances. The API key name is the tenant. Every VM has the tag `fabrium:tenant`. | Prod and stage share one service and one AWS account. The code enforces the isolation. |
-| Secret delivery | A single-use bootstrap token in the user data. The VM redeems it once over HTTPS. | Every PowerUser of the account can read user data in plain text, and it stays for the life of the VM. Design §10.3 already defines a bootstrap token. |
+| Secret delivery | A single-use bootstrap token in the user data. The VM redeems it once over HTTPS. A repeat within 60 s gets the same payload, so a lost answer does not strand the VM. | Every PowerUser of the account can read user data in plain text, and it stays for the life of the VM. Design §10.3 already defines a bootstrap token. |
 | GitHub credential | The admin pastes a token in the form. No deploy keys and no GitHub App tokens in v1. | It is the simplest path that works. Deploy keys are SSH only and need repository admin rights. |
 | Identity registration | Runtime appservice registration through the tuwunel admin room (`!admin appservices register`). | No tuwunel restart for each new agent. A restart interrupts chat for every user. |
 | Instance types | Allowlist: `c6a`, `m6a`, and `r6a` (SEV-SNP on), `t3`, and `t3a`. Default `t3a.medium`. | `t3a.medium` (2 vCPU, 4 GiB) is the cheapest 4 GiB type that runs the x86_64 image: 27.45 USD per month in Ohio, plus about 1.60 USD for the disk (`fabrium/docs/tech/ec2-instance-types.md`). arm64 types are out of scope. |
@@ -100,7 +100,7 @@ Every route except `/health` and `/v1/bootstrap` needs `Authorization: Bearer <t
 | Region | `us-east-2` | `AWS_REGION` |
 | AMI | The newest image that the account owns with the name `ubuntu-24.04-jan3-dev-env-v3` | `AMI_NAME` |
 | Instance type | From the request. Default `t3a.medium`. | `INSTANCE_TYPES`, `DEFAULT_INSTANCE_TYPE` |
-| SEV-SNP | `CpuOptions.AmdSevSnp=enabled` for `c6a`, `m6a`, and `r6a` | Code |
+| SEV-SNP | `CpuOptions.AmdSevSnp=enabled` for the sizes that AWS lists: `c6a.large` to `c6a.16xlarge`, `m6a.large` to `m6a.8xlarge`, `r6a.large` to `r6a.4xlarge`. Only in `us-east-2` and `eu-west-1`. | Code |
 | Security group | `jan3-dev-env-ssh` | `SECURITY_GROUP` |
 | Key pair | `fabrium-vms`, for debugging | `KEY_NAME` |
 | Root volume | 20 GiB, gp3, encrypted | Code |
@@ -272,7 +272,7 @@ The control plane keeps its request timeout of 10 seconds. EC2 calls return in s
 
 ## Testing
 
-- [ ] Control plane unit tests with a fake EC2: tenant filter, `404` across tenants, `409`, allowlist and default, SEV-SNP only on `c6a`, `m6a`, and `r6a`, single-use token, TTL, `setup` states, payload limit.
+- [ ] Control plane unit tests with a fake EC2: tenant filter, `404` across tenants, `409`, allowlist and default, SEV-SNP only on the sizes and regions that AWS lists, token with a 60 s grace for repeats, TTL, `setup` states, payload limit.
 - [ ] `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check` pass.
 - [ ] `RunInstances` dry runs against AWS, for one type of each family.
 - [ ] zooid vitest: OpenID check, role gate, proxy, admission against a fake Matrix, payload builder.

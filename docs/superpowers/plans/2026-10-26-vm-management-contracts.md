@@ -34,7 +34,7 @@ Every error body is `{"error":"<short message>"}`. A `413` from the body limit c
 | `state` | The EC2 state name: `pending`, `running`, `stopping`, `stopped`, or `shutting-down`. `terminated` never appears. |
 | `public_ip` | A string, or `null`. |
 | `launched_at` | EC2 `LaunchTime`, RFC 3339, UTC, whole seconds. EC2 resets it at each start. |
-| `setup` | `delivered` if the instance has the tag `fabrium:setup=delivered`. Otherwise `pending` if the bootstrap store has a live entry for the instance. Otherwise `expired`. |
+| `setup` | `delivered` if the instance has the tag `fabrium:setup=delivered`. Otherwise `pending` if the bootstrap store has a live entry for the instance that no VM has redeemed. Otherwise `expired`. |
 
 The `setup` rule refines the 15-minute rule of the spec. A store entry lives 15 minutes, so the result is the same. After a restart of the control plane, a VM that did not redeem its token shows `expired` at once, which is correct: its payload is gone.
 
@@ -44,7 +44,7 @@ The `setup` rule refines the 15-minute rule of the spec. A store entry lives 15 
 { "name": "t3a.medium", "vcpus": 2, "memory_mib": 4096, "sev_snp": false, "default": true }
 ```
 
-The list keeps the order of `INSTANCE_TYPES`. `sev_snp` is true for the families `c6a`, `m6a`, and `r6a`.
+The list keeps the order of `INSTANCE_TYPES`. `sev_snp` is true for the sizes that AWS launches with AMD SEV-SNP: `c6a.large` to `c6a.16xlarge`, `m6a.large` to `m6a.8xlarge`, and `r6a.large` to `r6a.4xlarge`. Larger sizes launch without it. On shared tenancy, AWS has SEV-SNP only in `us-east-2` and `eu-west-1`, so the control plane does not start with a SEV-SNP type in another `AWS_REGION`.
 
 ### Routes
 
@@ -102,7 +102,8 @@ An `{id}` that is not of the form `^i-[0-9a-f]{8,17}$`, a VM of another tenant, 
 
 - `POST /v1/bootstrap` with `Authorization: Bearer <bootstrap token>`. No tenant key.
 - `200`: the `bootstrap` object of the create request, as JSON.
-- `404 {"error":"not found"}`: a token that is unknown, already used, or expired.
+- `404 {"error":"not found"}`: a token that is unknown or expired, or a repeat after the grace time.
+- A repeat within 60 s of the first redeem gets the same payload, for a VM whose first answer got lost. The 15-minute TTL still ends it. The stub keeps a body only when curl finishes it.
 
 ## 2. zooid browser API (web to zooid)
 
@@ -180,7 +181,7 @@ as_ubuntu bash -lc 'set -a; . /run/fabrium-agent-secrets.env; set +a; bash ~/fab
 
 `<ZOOID_COMMIT>` is the full commit of the running zooid image. The VM fetches it from the public `jan3dev/fabrium-web-ui` repository, so the commit must be pushed.
 
-Added after the first stage test: the secrets file also holds `FABRIUM_CREATOR='<user id>'`, the user who asked for the VM. After `configure-agent.sh`, the script runs `deploy/agent-vm/greet-creator.sh` the same way. The agent opens a direct room with the creator and sends a first message that its model writes. A failure of this step does not fail the setup.
+Added after the first stage test: the secrets file also holds `FABRIUM_CREATOR='<user id>'`, the user who asked for the VM. After `configure-agent.sh`, the script runs `deploy/agent-vm/greet-creator.sh` the same way. The agent opens a direct room with the creator and sends a first message that its model writes. A failure of this step does not fail the setup. A caller whose user ID is outside the strict grammar (`^@[a-z0-9._=/+-]+:[A-Za-z0-9.-]+(:[0-9]+)?$`) gets no greeting: the payload then has no `FABRIUM_CREATOR` and no greeting step, and the create goes on.
 
 ## 4. Tags
 
