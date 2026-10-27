@@ -7,7 +7,7 @@ URL='<PUBLIC_URL>/v1/bootstrap'
 TOKEN='<TOKEN>'
 PAYLOAD=/run/fabrium-bootstrap.json
 # The payload and the setup script hold secrets. Whatever happens, they do not stay in /run.
-trap 'rm -f "$PAYLOAD" /run/fabrium-setup.sh' EXIT
+trap 'rm -f "$PAYLOAD" "$PAYLOAD.part" /run/fabrium-setup.sh' EXIT
 
 deadline=$((SECONDS + 600))
 while [ "$SECONDS" -lt "$deadline" ]; do
