@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use common::*;
 use fabrium_control_plane::{
-    bootstrap::Store,
+    bootstrap::{Store, TTL},
     ec2::{Action, Instance, fake},
 };
 use serde_json::{Value, json};
@@ -625,7 +625,7 @@ async fn create_is_502_and_launches_nothing_when_aws_fails() {
 }
 
 #[tokio::test]
-async fn redeem_returns_the_payload_once() {
+async fn redeem_repeats_the_payload_only_within_the_grace_time() {
     let h = harness().await;
     let (_, vm) = create(&h.app, STAGE, &create_body("lima")).await;
     let token = token_in(&h.fake.launches()[0].user_data);
@@ -642,6 +642,19 @@ async fn redeem_returns_the_payload_once() {
     let (_, listed) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
     assert_eq!(listed[0]["setup"], "delivered");
 
+    // A VM whose first answer got lost asks again and gets the same payload.
+    let (status, body) = redeem(&h, &token).await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::OK, create_body("lima")["bootstrap"].clone())
+    );
+
+    // After the grace time, the token is used up.
+    let h =
+        harness_with(|s| s.bootstrap = Arc::new(Store::new(TTL).with_grace(Duration::ZERO))).await;
+    create(&h.app, STAGE, &create_body("lima")).await;
+    let token = token_in(&h.fake.launches()[0].user_data);
+    assert_eq!(redeem(&h, &token).await.0, StatusCode::OK);
     let (status, body) = redeem(&h, &token).await;
     assert_eq!((status, body), (StatusCode::NOT_FOUND, not_found()));
 }
@@ -752,8 +765,8 @@ async fn redeem_still_delivers_when_tagging_fails() {
     let (status, body) = redeem(&h, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, create_body("lima")["bootstrap"]);
-    // The token is used up all the same, and the VM is not marked.
-    assert_eq!(redeem(&h, &token).await.0, StatusCode::NOT_FOUND);
+    // A repeat within the grace time gets the payload again, and the VM is still not marked.
+    assert_eq!(redeem(&h, &token).await.0, StatusCode::OK);
     assert!(
         !h.fake
             .instance(vm["id"].as_str().unwrap())

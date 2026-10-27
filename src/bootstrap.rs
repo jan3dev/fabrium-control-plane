@@ -97,21 +97,42 @@ fn hash(token: &str) -> [u8; 32] {
 /// frequent.
 pub struct Store {
     ttl: Duration,
+    grace: Duration,
     entries: Mutex<HashMap<[u8; 32], Entry>>,
 }
+
+/// How long a redeemed payload stays, so that a VM whose first answer got lost can ask
+/// again. The TTL still ends it.
+pub const GRACE: Duration = Duration::from_secs(60);
 
 struct Entry {
     payload: Payload,
     instance: String,
     expires: Instant,
+    /// The first redeem.
+    redeemed: Option<Instant>,
+}
+
+impl Entry {
+    /// The TTL, or the end of the grace time after the first redeem if that comes first.
+    fn end(&self, grace: Duration) -> Instant {
+        (self.redeemed).map_or(self.expires, |at| self.expires.min(at + grace))
+    }
 }
 
 impl Store {
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl,
+            grace: GRACE,
             entries: Mutex::default(),
         }
+    }
+
+    /// Replaces the grace time of `GRACE`.
+    pub fn with_grace(mut self, grace: Duration) -> Self {
+        self.grace = grace;
+        self
     }
 
     // The lock is never held across an await, and nothing in a critical section panics.
@@ -119,29 +140,41 @@ impl Store {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Keeps the payload for `ttl`. Also drops the entries that have expired.
+    /// Keeps the payload for `ttl`. Also drops the entries that have ended.
     pub fn insert(&self, token: &str, payload: Payload, instance: &str) {
         let now = Instant::now();
         let mut entries = self.entries();
-        entries.retain(|_, e| e.expires > now);
+        entries.retain(|_, e| e.end(self.grace) > now);
         let entry = Entry {
             payload,
             instance: instance.to_owned(),
             expires: now + self.ttl,
+            redeemed: None,
         };
         entries.insert(hash(token), entry);
     }
 
-    /// Removes the entry. `None` if the token is unknown, used, or expired.
+    /// The payload and its instance. A repeat within the grace time gets the same payload,
+    /// so a lost answer does not strand the VM. `None` if the token is unknown or its entry
+    /// has ended.
     pub fn redeem(&self, token: &str) -> Option<(Payload, String)> {
-        let entry = self.entries().remove(&hash(token))?;
-        (entry.expires > Instant::now()).then_some((entry.payload, entry.instance))
+        let now = Instant::now();
+        let key = hash(token);
+        let mut entries = self.entries();
+        let entry = entries.get_mut(&key)?;
+        if entry.end(self.grace) <= now {
+            entries.remove(&key);
+            return None;
+        }
+        entry.redeemed.get_or_insert(now);
+        Some((entry.payload.clone(), entry.instance.clone()))
     }
 
-    /// True if the instance has an entry that has not expired.
+    /// True if the instance has an entry that no VM has redeemed and that has not expired.
     pub fn has_live(&self, instance: &str) -> bool {
         let now = Instant::now();
-        (self.entries().values()).any(|e| e.instance == instance && e.expires > now)
+        (self.entries().values())
+            .any(|e| e.instance == instance && e.redeemed.is_none() && e.expires > now)
     }
 
     pub fn remove_instance(&self, instance: &str) {
@@ -190,13 +223,44 @@ mod tests {
     }
 
     #[test]
-    fn redeem_is_single_use() {
+    fn a_repeat_within_the_grace_time_gets_the_same_payload() {
         let store = Store::new(TTL);
         store.insert("tok", payload(), "i-1");
         let (got, instance) = store.redeem("tok").unwrap();
         assert!(got == payload());
         assert_eq!(instance, "i-1");
+        // The first answer got lost on its way: the VM asks again.
+        let (again, instance) = store.redeem("tok").unwrap();
+        assert!(again == payload());
+        assert_eq!(instance, "i-1");
+    }
+
+    #[test]
+    fn a_repeat_after_the_grace_time_is_refused() {
+        let store = Store::new(TTL).with_grace(Duration::ZERO);
+        store.insert("tok", payload(), "i-1");
+        assert!(store.redeem("tok").is_some());
         assert!(store.redeem("tok").is_none());
+        // The entry is gone, not only refused.
+        assert!(store.entries().is_empty());
+    }
+
+    #[test]
+    fn the_grace_time_ends_with_the_ttl() {
+        let store = Store::new(Duration::from_millis(200));
+        store.insert("tok", payload(), "i-1");
+        assert!(store.redeem("tok").is_some());
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(store.redeem("tok").is_none());
+    }
+
+    #[test]
+    fn insert_drops_entries_past_their_grace_time() {
+        let store = Store::new(TTL).with_grace(Duration::ZERO);
+        store.insert("a", payload(), "i-1");
+        store.redeem("a").unwrap();
+        store.insert("b", payload(), "i-2");
+        assert_eq!(store.entries().len(), 1);
     }
 
     #[test]

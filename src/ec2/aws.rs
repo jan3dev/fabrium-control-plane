@@ -483,13 +483,15 @@ mod tests {
     }
 
     #[test]
-    fn only_amd_families_get_sev_snp() {
+    fn only_sev_snp_types_get_sev_snp() {
         let cases = [
             ("t3a.medium", false),
             ("t3.large", false),
             ("c6a.large", true),
             ("m6a.large", true),
             ("r6a.large", true),
+            ("m6a.12xlarge", false),
+            ("c6a.metal", false),
         ];
         for (instance_type, sev) in cases {
             let cpu = request(instance_type)
