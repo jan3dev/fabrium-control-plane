@@ -417,8 +417,7 @@ trap 'rm -f "$PAYLOAD" "$PAYLOAD.part" /run/fabrium-setup.sh' EXIT
 
 deadline=$((SECONDS + 600))
 while [ "$SECONDS" -lt "$deadline" ]; do
-  # A cut answer leaves part of a body: keep only a whole one. For a short time, the
-  # control plane answers a repeat with the same payload.
+  # Keep only a whole body: a cut answer leaves part of one, and a repeat gets the same payload.
   if printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" |
     curl -fsS -K - --max-time 20 -X POST -o "$PAYLOAD.part" "$URL"; then
     mv "$PAYLOAD.part" "$PAYLOAD"
