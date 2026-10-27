@@ -1,0 +1,83 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Describe",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeImages",
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceTypes",
+        "ec2:DescribeSecurityGroups"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "RunTaggedInstance",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:us-east-2:<ACCOUNT_ID>:instance/*",
+      "Condition": {
+        "Null": { "aws:RequestTag/fabrium:tenant": "false" },
+        "StringEquals": { "ec2:MetadataHttpTokens": "required" },
+        "StringLike": { "ec2:InstanceType": ["t3.*", "t3a.*", "c6a.*", "m6a.*", "r6a.*"] }
+      }
+    },
+    {
+      "Sid": "RunFromFabriumImage",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:us-east-2::image/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:Owner": "<ACCOUNT_ID>",
+          "ec2:ResourceTag/Project": "jan3-dev-env"
+        }
+      }
+    },
+    {
+      "Sid": "RunWithFixedNetworkAndKey",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:us-east-2:<ACCOUNT_ID>:security-group/<SECURITY_GROUP_ID>",
+        "arn:aws:ec2:us-east-2:<ACCOUNT_ID>:key-pair/fabrium-vms",
+        "arn:aws:ec2:us-east-2:<ACCOUNT_ID>:subnet/*",
+        "arn:aws:ec2:us-east-2:<ACCOUNT_ID>:network-interface/*",
+        "arn:aws:ec2:us-east-2:<ACCOUNT_ID>:volume/*"
+      ]
+    },
+    {
+      "Sid": "TagAtLaunch",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": [
+        "arn:aws:ec2:us-east-2:<ACCOUNT_ID>:instance/*",
+        "arn:aws:ec2:us-east-2:<ACCOUNT_ID>:volume/*"
+      ],
+      "Condition": { "StringEquals": { "ec2:CreateAction": "RunInstances" } }
+    },
+    {
+      "Sid": "MarkSetupDelivered",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": "arn:aws:ec2:us-east-2:<ACCOUNT_ID>:instance/*",
+      "Condition": {
+        "Null": { "aws:ResourceTag/fabrium:tenant": "false", "aws:TagKeys": "false" },
+        "ForAllValues:StringEquals": { "aws:TagKeys": ["fabrium:setup"] }
+      }
+    },
+    {
+      "Sid": "Lifecycle",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:StartInstances",
+        "ec2:StopInstances",
+        "ec2:RebootInstances",
+        "ec2:TerminateInstances"
+      ],
+      "Resource": "arn:aws:ec2:us-east-2:<ACCOUNT_ID>:instance/*",
+      "Condition": { "Null": { "aws:ResourceTag/fabrium:tenant": "false" } }
+    }
+  ]
+}

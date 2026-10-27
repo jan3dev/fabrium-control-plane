@@ -1,0 +1,21 @@
+# Puts Caddy in front of the control plane for TLS. Usage: "Deploy on the control host" in the README.
+# Caddy reads only CP_HOST from `.env`, so the AWS keys stay out of its container.
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - control-plane
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CP_HOST: ${CP_HOST:?set CP_HOST in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

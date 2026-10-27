@@ -5,7 +5,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
-use fabrium_control_plane::{AppState, auth::ApiKeys, build_app, db};
+use fabrium_control_plane::{AppState, build_app, config::Config, db, ec2::FakeEc2};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -14,10 +14,18 @@ use tower::ServiceExt;
 const HASH: &str = "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b";
 
 async fn state() -> AppState {
-    AppState {
-        db: db::connect("sqlite::memory:").await.unwrap(),
-        api_keys: Arc::new(ApiKeys::parse(&format!("zooid:{HASH}")).unwrap()),
-    }
+    let config = Config::from_lookup(|k| match k {
+        "API_KEYS" => Some(format!("zooid:{HASH}")),
+        "PUBLIC_URL" => Some("https://cp.example.org".to_owned()),
+        _ => None,
+    })
+    .unwrap();
+    AppState::new(
+        db::connect("sqlite::memory:").await.unwrap(),
+        config.api_keys,
+        config.vm,
+        Arc::new(FakeEc2::default()),
+    )
 }
 
 async fn app() -> Router {

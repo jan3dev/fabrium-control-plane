@@ -15,6 +15,8 @@ pub enum ParseError {
     Empty,
     #[error("API_KEYS entry {0:?} must look like <name>:<sha256-hex>")]
     Malformed(String),
+    #[error("API_KEYS name {0:?} may use only a-z, 0-9, and -")]
+    BadName(String),
     #[error("API_KEYS has a duplicate name {0:?}")]
     Duplicate(String),
     #[error("API_KEYS entry {0:?} repeats the hash of an earlier entry")]
@@ -34,6 +36,13 @@ impl ApiKeys {
             if name.is_empty() || hex::decode_to_slice(hash, &mut digest).is_err() {
                 return Err(bad());
             }
+            // The name becomes the value of the `fabrium:tenant` tag.
+            if !name
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+            {
+                return Err(ParseError::BadName(name.to_owned()));
+            }
             if keys.iter().any(|(n, _)| n == name) {
                 return Err(ParseError::Duplicate(name.to_owned()));
             }
@@ -51,8 +60,7 @@ impl ApiKeys {
     fn find(&self, key: &str) -> Option<&str> {
         let digest = Sha256::digest(key.as_bytes());
         let mut found = None;
-        // Visit every entry so the time does not reveal which one matched.
-        // `parse` keeps digests unique, so at most one entry matches.
+        // Visit every entry (digests are unique) so the time does not reveal which one matched.
         for (name, hash) in &self.0 {
             if bool::from(digest.as_slice().ct_eq(hash)) {
                 found = Some(name.as_str());
@@ -68,7 +76,7 @@ pub struct Client {
 }
 
 /// Scheme is case-insensitive and whitespace around the token is ignored (RFC 9110).
-fn bearer_token(header: &str) -> Option<&str> {
+pub(crate) fn bearer_token(header: &str) -> Option<&str> {
     let (scheme, token) = header.split_once(char::is_whitespace)?;
     let token = token.trim();
     (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
@@ -125,6 +133,22 @@ mod tests {
             ApiKeys::parse(&dup),
             Err(ParseError::Duplicate(_))
         ));
+    }
+
+    #[test]
+    fn tenant_names_use_lowercase_letters_digits_and_hyphens() {
+        for ok in ["prod-sim", "a1", "stage", "-"] {
+            assert!(ApiKeys::parse(&format!("{ok}:{HASH}")).is_ok(), "{ok}");
+        }
+        for bad in ["Stage", "prod_sim", "a.b", "é", "a b"] {
+            assert!(
+                matches!(
+                    ApiKeys::parse(&format!("{bad}:{HASH}")),
+                    Err(ParseError::BadName(n)) if n == bad
+                ),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
