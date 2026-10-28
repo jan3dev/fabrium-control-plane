@@ -117,6 +117,54 @@ async fn a_refused_source_changes_nothing() {
 }
 
 #[tokio::test]
+async fn every_tenant_route_checks_the_key_and_the_source() {
+    let h = harness().await;
+    h.fake.seed(stage_vm(ID, "lima", "running", "t3a.medium"));
+    let create = serde_json::to_vec(&create_body("new")).unwrap();
+    let routes = [
+        ("GET", "/v1/ping".to_owned(), Vec::new()),
+        ("GET", "/v1/instance-types".to_owned(), Vec::new()),
+        ("GET", "/v1/vms".to_owned(), Vec::new()),
+        ("POST", "/v1/vms".to_owned(), create),
+        ("DELETE", format!("/v1/vms/{ID}"), Vec::new()),
+        ("POST", format!("/v1/vms/{ID}/start"), Vec::new()),
+        ("POST", format!("/v1/vms/{ID}/stop"), Vec::new()),
+        ("POST", format!("/v1/vms/{ID}/reboot"), Vec::new()),
+    ];
+    for (method, uri, body) in &routes {
+        // A missing or bad key is a 401, from any address.
+        for from in [Some(STAGE_SOURCE), Some(PROD_SOURCE), None] {
+            for auth in [None, Some("Bearer wrong"), Some("Basic stage-secret")] {
+                let sent = send_from(&h.app, method, uri, auth, from, body.clone()).await;
+                let want = StatusCode::UNAUTHORIZED;
+                assert_eq!(sent.0, want, "{method} {uri} {auth:?} from {from:?}");
+            }
+        }
+        // A valid key from an address that is not a source of its tenant is a 403.
+        for from in [Some(PROD_SOURCE), Some("203.0.113.9"), None] {
+            let sent = send_from(&h.app, method, uri, Some(STAGE), from, body.clone()).await;
+            let want = StatusCode::FORBIDDEN;
+            assert_eq!(sent.0, want, "{method} {uri} from {from:?}");
+            assert_eq!(
+                sent.1, br#"{"error":"forbidden"}"#,
+                "{method} {uri} from {from:?}"
+            );
+        }
+    }
+    // The refused requests changed nothing.
+    assert!(h.fake.launches().is_empty());
+    assert!(h.fake.actions().is_empty());
+    // From a source of the tenant no route refuses the key, so each route exists and the loops
+    // above tested it.
+    for (method, uri, body) in &routes {
+        let from = Some(STAGE_SOURCE);
+        let (status, _) = send_from(&h.app, method, uri, Some(STAGE), from, body.clone()).await;
+        let refused = [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN];
+        assert!(!refused.contains(&status), "{method} {uri} gave {status}");
+    }
+}
+
+#[tokio::test]
 async fn list_shows_only_live_vms_of_the_caller_sorted_by_name() {
     let h = harness().await;
     h.fake.seed(Instance {
