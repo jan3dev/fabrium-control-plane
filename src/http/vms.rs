@@ -127,7 +127,7 @@ async fn find(state: &AppState, tenant: &str, id: &str) -> Result<Instance, AppE
         .ok_or(AppError::NotFound)
 }
 
-/// `POST` route that applies `action` to the VM of the path. 
+/// `POST` route that applies `action` to the VM of the path.
 pub fn action(action: Action) -> MethodRouter<AppState> {
     post(
         move |state: State<AppState>,
