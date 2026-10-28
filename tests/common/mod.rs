@@ -207,10 +207,19 @@ pub fn token_in(user_data: &str) -> String {
         .to_owned()
 }
 
-/// `POST /v1/bootstrap` with the token of the first launch.
+/// The public IP of the VM that holds `token` in its user data, as the fake gave it.
+pub fn vm_ip(h: &Harness, token: &str) -> String {
+    let launches = h.fake.launches();
+    let at = launches
+        .iter()
+        .position(|l| token_in(&l.user_data) == token);
+    let n = at.expect("a launched VM holds the token");
+    (h.fake.launched()[n].public_ip.clone()).expect("a launched VM has a public IP")
+}
+
+/// `POST /v1/bootstrap` from the public IP of the VM that holds the token.
 pub async fn redeem(h: &Harness, token: &str) -> (StatusCode, Value) {
-    let auth = format!("Bearer {token}");
-    call(&h.app, "POST", "/v1/bootstrap", Some(&auth)).await
+    redeem_from(h, token, &vm_ip(h, token)).await
 }
 
 /// `POST /v1/bootstrap` as Caddy forwards it, with `X-Forwarded-For: <forwarded_for>`.

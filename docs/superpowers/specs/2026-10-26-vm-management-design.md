@@ -70,7 +70,7 @@ A key works only from the sources of its tenant. `API_SOURCES` lists `<tenant>:<
 | `POST /v1/vms/{id}/stop` | None | `202 {vm}` |
 | `POST /v1/vms/{id}/reboot` | None | `202 {vm}` |
 | `DELETE /v1/vms/{id}` | None | `202` |
-| `POST /v1/bootstrap` | `Authorization: Bearer <bootstrap token>` | `200 {files, script}`, again only from the same address within 60 s, then `404` |
+| `POST /v1/bootstrap` | `Authorization: Bearer <bootstrap token>` | `200 {files, script}` only from the public IP of the VM that owns the token, and again from the same address within 60 s, then `404`. Another address gives `404`. |
 
 ### Rules
 
@@ -89,6 +89,7 @@ A key works only from the sources of its tenant. `API_SOURCES` lists `<tenant>:<
 ### Bootstrap
 
 - The token is 32 random bytes, base64url. The store keeps only the SHA-256 hash of the token, with the payload, the instance ID, and the expiry (15 minutes).
+- A redeem works only from the public IPv4 of the VM that owns the token. The control plane reads that address from EC2 at each redeem and compares it with the last `X-Forwarded-For` entry. Another address, no address, or a VM without a public IP gives `404` and a warning in the log, and the token stays valid: the VM can still redeem it. A token that the store does not know gives `404` without an EC2 call. A failed EC2 lookup gives `502`. So a VM needs a public IP: the default VPC subnet assigns one.
 - A redeem returns the payload and then sets the `fabrium:setup` tag. The entry stays 60 s more, for a repeat from the same address: a VM whose first answer got lost asks again. A repeat from another address gives `404` and a warning in the log with both addresses. After the 60 s, every redeem gives `404`.
 - A delete removes the entry of that VM, if it is still there.
 - The store is in memory. `ponytail:` a restart loses the payloads that are not redeemed; those VMs show `expired` and must be created again. Persist the store only if restarts during launches become frequent.
@@ -266,7 +267,7 @@ The control plane keeps its request timeout of 10 seconds. EC2 calls return in s
 
 ## Security notes
 
-- The bootstrap token stays in the user data until the VM redeems it, 15 minutes or less. A PowerUser can read it there. Only the first caller gets the payload, again only from its address, so a theft is visible: if the thief redeems first, the redeem of the real VM gets `404`, its agent never comes online, and `/var/log/fabrium-bootstrap.log` on the VM shows the failure. The list shows `delivered`, because the redeem of the thief set the tag. If the thief comes after the VM, the control plane refuses it and logs a warning with both addresses.
+- The bootstrap token stays in the user data until the VM redeems it, 15 minutes or less. A PowerUser can read it there. Only a caller from the public IP of the VM that owns the token gets the payload. A thief with the token gets `404` from any other address and does not use the token up, so the VM can still redeem it. The control plane logs a warning with the VM and both addresses. v1 does not defend against code that runs on the VM itself.
 - v1 does not protect against insiders of the AWS account. A PowerUser can also make a snapshot of a disk.
 - Secrets on the VM: `~/zooid/.env` (the AS token of the VM) and `~/zooid/secrets.env` (Haven and GitHub), mode 600. The agent can read them. "Security" in `deploy/README.md` accepts this.
 - Types without SEV-SNP are allowed, and the UI marks them. `fabrium/docs/tech/create-vm-from-image.md` advises against secrets on them.

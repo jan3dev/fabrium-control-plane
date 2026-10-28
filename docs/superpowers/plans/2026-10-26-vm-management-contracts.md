@@ -57,7 +57,7 @@ The list keeps the order of `INSTANCE_TYPES`. `sev_snp` is true for the sizes th
 | `POST /v1/vms/{id}/stop` | `202 vm` | `404`, `409`, `502` |
 | `POST /v1/vms/{id}/reboot` | `202 vm` | `404`, `409`, `502` |
 | `DELETE /v1/vms/{id}` | `202`, empty body | `404`, `502` |
-| `POST /v1/bootstrap` | `200 {"files":[...],"script":"..."}` | `404 {"error":"not found"}` |
+| `POST /v1/bootstrap` | `200 {"files":[...],"script":"..."}` | `404 {"error":"not found"}`, `502` |
 
 State rules for actions. Any other state gives `409 {"error":"vm is <state>"}`:
 
@@ -101,9 +101,10 @@ An `{id}` that is not of the form `^i-[0-9a-f]{8,17}$`, a VM of another tenant, 
 ### Bootstrap redeem
 
 - `POST /v1/bootstrap` with `Authorization: Bearer <bootstrap token>`. No tenant key.
-- `200`: the `bootstrap` object of the create request, as JSON.
-- `404 {"error":"not found"}`: a token that is unknown or expired, a repeat after the grace time, or a repeat from another address.
-- A repeat within 60 s of the first redeem, from the same address, gets the same payload, for a VM whose first answer got lost. The 15-minute TTL still ends it. The address is the last `X-Forwarded-For` entry, which Caddy sets. A repeat from another address is logged as a warning with both addresses. The stub keeps a body only when curl finishes it.
+- `200`: the `bootstrap` object of the create request, as JSON. Only the VM that owns the token gets it: the caller address must be the public IPv4 of that instance. The address is the last `X-Forwarded-For` entry, which Caddy sets. The control plane reads the public IP from EC2 at each redeem, so a VM needs one (the default VPC subnet assigns it).
+- `404 {"error":"not found"}`: a token that is unknown or expired, a repeat after the grace time, a caller with no address or with another address than the VM's, or a VM without a public IP. The control plane logs a warning for a refusal with a live token, and the token stays valid: the VM can still redeem it.
+- `502 {"error":"aws request failed"}`: the EC2 lookup failed. Only a live token reaches it. The VM asks again.
+- A repeat within 60 s of the first redeem, from the same address, gets the same payload, for a VM whose first answer got lost. The 15-minute TTL still ends it. A repeat from another address is logged as a warning with both addresses. The stub keeps a body only when curl finishes it.
 
 ## 2. zooid browser API (web to zooid)
 

@@ -115,7 +115,7 @@ A valid key also needs a source address. The address is the last `X-Forwarded-Fo
 | POST | `/v1/vms/{id}/stop` | `202 vm` | `404`, `409`, `502` |
 | POST | `/v1/vms/{id}/reboot` | `202 vm` | `404`, `409`, `502` |
 | DELETE | `/v1/vms/{id}` | `202`, empty body | `404`, `502` |
-| POST | `/v1/bootstrap` | `200 {"files":[...],"script":"..."}` | `404` |
+| POST | `/v1/bootstrap` | `200 {"files":[...],"script":"..."}` | `404`, `502` |
 
 Every error body is `{"error":"<short message>"}`. A `413` can have a plain-text body. Clients must branch on the status code, not on the message.
 
@@ -196,9 +196,13 @@ A failed AWS call gives `502 {"error":"aws request failed"}`. The AWS detail goe
 
 The user data of a new VM is a short script with the public URL and a token. The token is 32 random bytes in base64url. The service keeps only its SHA-256, with the payload, in memory for 15 minutes.
 
-The VM sends `POST /v1/bootstrap` with `Authorization: Bearer <token>`. The service returns the payload, then sets the tag `fabrium:setup=delivered` on the instance. A failed or slow tag (5 s limit) is logged, and the VM still gets its payload.
+The VM sends `POST /v1/bootstrap` with `Authorization: Bearer <token>`. The token works only from the public IPv4 address of its own VM. The service finds the instance that owns the token, reads the public IP of that instance from EC2, and compares it with the address of the caller. The address is the last `X-Forwarded-For` entry, which Caddy sets: the service listens on localhost only. If the two match, the service returns the payload, then sets the tag `fabrium:setup=delivered` on the instance. A failed or slow tag (5 s limit) is logged, and the VM still gets its payload.
 
-For 60 s after the first redeem, a repeat from the same address gets the same payload, so a VM whose first answer got lost can ask again. The address is the last `X-Forwarded-For` entry, which Caddy sets: the service listens on localhost only. A repeat from another address gets `404`, and the service logs a warning with both addresses: the token reached someone else than the VM. An unknown token, an expired token, a token after its 60 s, and a missing header also give `404 {"error":"not found"}`. The token is not a tenant API key, and a tenant API key is not a token.
+A request from another address, a request with no usable address, and a request while EC2 shows no public IP for the VM all get `404`. The service logs a warning with the VM and the addresses, and it keeps the token: a thief that holds the token gets nothing, and the VM can still redeem it.
+
+A VM needs a public IPv4 address, so launch VMs in a subnet that assigns one. The default VPC subnet does, and the service sets no subnet. A VM behind a NAT gateway calls from the address of the gateway, so it never gets its payload.
+
+For 60 s after the first redeem, a repeat from the same address gets the same payload, so a VM whose first answer got lost can ask again. A repeat from another address gets `404`, and the service logs a warning with both addresses: the public IP of the VM changed after its first redeem. An unknown token, an expired token, a token after its 60 s, and a missing header also give `404 {"error":"not found"}`. A token that the service does not know costs no EC2 call. If the EC2 lookup fails for a live token, the answer is `502`, and the VM asks again. The token is not a tenant API key, and a tenant API key is not a token.
 
 A restart of the service loses the payloads that no VM redeemed yet. Those VMs show `expired`.
 
