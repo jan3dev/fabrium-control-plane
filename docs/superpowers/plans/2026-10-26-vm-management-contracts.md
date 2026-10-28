@@ -10,7 +10,7 @@ The control plane, the zooid daemon, and the web UI share these shapes. The thre
 
 ## 1. Control plane API (zooid to control plane)
 
-Every route except `/health` and `/v1/bootstrap` needs `Authorization: Bearer <tenant API key>`. A missing or wrong key gives `401 {"error":"missing or invalid API key"}`.
+Every route except `/health` and `/v1/bootstrap` needs `Authorization: Bearer <tenant API key>`. A missing or wrong key gives `401 {"error":"missing or invalid API key"}`. A valid key from an address that is not a source of its tenant (`API_SOURCES`) gives `403 {"error":"forbidden"}`. The address is the last `X-Forwarded-For` entry, which Caddy sets.
 
 Every error body is `{"error":"<short message>"}`. A `413` from the body limit can have a plain-text body. Clients branch on the status code, never on the message.
 

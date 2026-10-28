@@ -1,4 +1,4 @@
-use std::{net::IpAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json,
@@ -9,7 +9,7 @@ use tracing::Instrument;
 
 use crate::{
     AppState,
-    auth::bearer_token,
+    auth::{bearer_token, client_address},
     bootstrap::{Payload, Redeemed},
     ec2::Ec2,
     error::AppError,
@@ -28,7 +28,7 @@ pub async fn redeem(
         .and_then(|v| v.to_str().ok())
         .and_then(bearer_token)
         .ok_or(AppError::NotFound)?;
-    let from = caller_address(&headers);
+    let from = client_address(&headers).map_or_else(|| "unknown".to_owned(), |ip| ip.to_string());
     match state
         .bootstrap
         .redeem(token, &from)
@@ -46,15 +46,6 @@ pub async fn redeem(
             Err(AppError::NotFound)
         }
     }
-}
-
-/// The caller: the last `X-Forwarded-For` entry, which Caddy sets.
-fn caller_address(headers: &HeaderMap) -> String {
-    (headers.get("x-forwarded-for"))
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit(',').next())
-        .and_then(|a| a.trim().parse::<IpAddr>().ok())
-        .map_or_else(|| "unknown".to_owned(), |ip| ip.to_string())
 }
 
 /// Sets the tag `fabrium:setup=delivered`. It only logs: the VM has its payload already.

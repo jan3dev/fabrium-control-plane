@@ -65,6 +65,9 @@ async fn logs_never_hold_a_token_a_key_or_the_payload() {
     create(&h.app, STAGE, &create_body("other")).await;
     call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
     h.fake.fail(false);
+    // A valid key from an address that its tenant does not use, or from none, is refused and logged.
+    call_from(&h.app, "GET", "/v1/vms", Some(STAGE), Some(PROD_SOURCE)).await;
+    call_from(&h.app, "GET", "/v1/vms", Some(STAGE), None).await;
     let uri = format!("/v1/vms/{}", vm["id"].as_str().unwrap());
     call_raw(&h.app, "DELETE", &uri, Some(STAGE)).await;
     // A tag call that hangs is cut off after 5 s, and that is logged too.
@@ -91,6 +94,15 @@ async fn logs_never_hold_a_token_a_key_or_the_payload() {
     ];
     for line in lines {
         assert!(logs.contains(line), "no {line:?} in the log:\n{logs}");
+    }
+    // A refused source is logged with its tenant and its address, or `none`.
+    let refused: Vec<&str> = (logs.lines())
+        .filter(|l| l.contains("not a source of the tenant"))
+        .collect();
+    for from in [PROD_SOURCE, "none"] {
+        let want = format!("tenant=stage from={from}");
+        let found = refused.iter().any(|l| l.contains(&want));
+        assert!(found, "no refused line with {want:?} in the log:\n{logs}");
     }
     for secret in [
         token.as_str(),

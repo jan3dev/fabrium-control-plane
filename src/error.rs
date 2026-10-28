@@ -9,6 +9,9 @@ use serde_json::json;
 pub enum AppError {
     #[error("missing or invalid API key")]
     Unauthorized,
+    /// A valid key from an address that is not a source of its tenant.
+    #[error("forbidden")]
+    Forbidden,
     #[error("{0}")]
     BadRequest(String),
     #[error("not found")]
@@ -36,6 +39,7 @@ impl IntoResponse for AppError {
                 body,
             )
                 .into_response(),
+            Self::Forbidden => (StatusCode::FORBIDDEN, body).into_response(),
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, body).into_response(),
             Self::NotFound => (StatusCode::NOT_FOUND, body).into_response(),
             Self::Conflict(_) => (StatusCode::CONFLICT, body).into_response(),

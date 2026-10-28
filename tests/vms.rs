@@ -75,6 +75,48 @@ async fn vm_routes_need_a_tenant_key() {
 }
 
 #[tokio::test]
+async fn a_key_works_only_from_the_sources_of_its_tenant() {
+    let h = harness().await;
+    let cases = [
+        (STAGE, STAGE_SOURCE, StatusCode::OK),
+        (STAGE, PROD_SOURCE, StatusCode::FORBIDDEN),
+        (PROD, PROD_SOURCE, StatusCode::OK),
+        (PROD, STAGE_SOURCE, StatusCode::FORBIDDEN),
+    ];
+    for (auth, source, want) in cases {
+        for uri in ["/v1/instance-types", "/v1/vms"] {
+            let (status, body) = call_from(&h.app, "GET", uri, Some(auth), Some(source)).await;
+            assert_eq!(status, want, "{auth} {source} {uri}");
+            if want == StatusCode::FORBIDDEN {
+                assert_eq!(body, json!({ "error": "forbidden" }), "{auth} {source}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_refused_source_changes_nothing() {
+    let h = harness().await;
+    h.fake.seed(stage_vm(ID, "lima", "running", "t3a.medium"));
+    // The key is the tenant's. The source is not.
+    let from = Some(PROD_SOURCE);
+    let body = serde_json::to_vec(&create_body("new")).unwrap();
+    let (status, _) = send_from(&h.app, "POST", "/v1/vms", Some(STAGE), from, body).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for (method, suffix) in [("POST", "/stop"), ("POST", "/reboot"), ("DELETE", "")] {
+        let uri = format!("/v1/vms/{ID}{suffix}");
+        let (status, _) = call_from(&h.app, method, &uri, Some(STAGE), from).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+    assert!(h.fake.launches().is_empty());
+    assert!(h.fake.actions().is_empty());
+    // From the right source the same request works, so the source caused the 403.
+    let uri = format!("/v1/vms/{ID}/stop");
+    let (status, _) = call_from(&h.app, "POST", &uri, Some(STAGE), Some(STAGE_SOURCE)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
 async fn list_shows_only_live_vms_of_the_caller_sorted_by_name() {
     let h = harness().await;
     h.fake.seed(Instance {

@@ -59,6 +59,8 @@ Browser ──OpenID──▶ Caddy ──/_fabrium/*──▶ zooid daemon ─�
 
 Every route except `/health` and `/v1/bootstrap` needs `Authorization: Bearer <tenant API key>`. The key name in `API_KEYS` is the tenant. The parser accepts one key per name. A tenant name matches `^[a-z0-9-]+$`, because it becomes a tag value; the service does not start with another name.
 
+A key works only from the sources of its tenant. `API_SOURCES` lists `<tenant>:<ip-or-cidr>` entries, and the service does not start unless every tenant has at least one. The source is the last `X-Forwarded-For` entry, which Caddy sets. A request from another address, or with no usable address, gives `403 {"error":"forbidden"}`.
+
 | Method and path | Request | Response |
 |---|---|---|
 | `GET /v1/instance-types` | None | `200 [{name, vcpus, memory_mib, sev_snp, default}]` |
@@ -116,6 +118,7 @@ These values move the logic of `scripts/create-vm.sh`, `scripts/start-vm.sh`, an
 | Variable | Example | Note |
 |---|---|---|
 | `API_KEYS` | `stage:<sha256>,prod:<sha256>` | Exists. The name is the tenant. |
+| `API_SOURCES` | `stage:<ip-or-cidr>,prod:<ip-or-cidr>` | The addresses that each tenant calls from. Every tenant needs one. |
 | `PUBLIC_URL` | `https://<host>` | Base URL that VMs use to redeem tokens. |
 | `AWS_REGION` | `us-east-2` | |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | None | Temporary credentials for now. The dedicated profile replaces them. |
