@@ -75,6 +75,96 @@ async fn vm_routes_need_a_tenant_key() {
 }
 
 #[tokio::test]
+async fn a_key_works_only_from_the_sources_of_its_tenant() {
+    let h = harness().await;
+    let cases = [
+        (STAGE, STAGE_SOURCE, StatusCode::OK),
+        (STAGE, PROD_SOURCE, StatusCode::FORBIDDEN),
+        (PROD, PROD_SOURCE, StatusCode::OK),
+        (PROD, STAGE_SOURCE, StatusCode::FORBIDDEN),
+    ];
+    for (auth, source, want) in cases {
+        for uri in ["/v1/instance-types", "/v1/vms"] {
+            let (status, body) = call_from(&h.app, "GET", uri, Some(auth), Some(source)).await;
+            assert_eq!(status, want, "{auth} {source} {uri}");
+            if want == StatusCode::FORBIDDEN {
+                assert_eq!(body, json!({ "error": "forbidden" }), "{auth} {source}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_refused_source_changes_nothing() {
+    let h = harness().await;
+    h.fake.seed(stage_vm(ID, "lima", "running", "t3a.medium"));
+    // The key is the tenant's. The source is not.
+    let from = Some(PROD_SOURCE);
+    let body = serde_json::to_vec(&create_body("new")).unwrap();
+    let (status, _) = send_from(&h.app, "POST", "/v1/vms", Some(STAGE), from, body).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for (method, suffix) in [("POST", "/stop"), ("POST", "/reboot"), ("DELETE", "")] {
+        let uri = format!("/v1/vms/{ID}{suffix}");
+        let (status, _) = call_from(&h.app, method, &uri, Some(STAGE), from).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+    assert!(h.fake.launches().is_empty());
+    assert!(h.fake.actions().is_empty());
+    // From the right source the same request works, so the source caused the 403.
+    let uri = format!("/v1/vms/{ID}/stop");
+    let (status, _) = call_from(&h.app, "POST", &uri, Some(STAGE), Some(STAGE_SOURCE)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn every_tenant_route_checks_the_key_and_the_source() {
+    let h = harness().await;
+    h.fake.seed(stage_vm(ID, "lima", "running", "t3a.medium"));
+    let create = serde_json::to_vec(&create_body("new")).unwrap();
+    let routes = [
+        ("GET", "/v1/ping".to_owned(), Vec::new()),
+        ("GET", "/v1/instance-types".to_owned(), Vec::new()),
+        ("GET", "/v1/vms".to_owned(), Vec::new()),
+        ("POST", "/v1/vms".to_owned(), create),
+        ("DELETE", format!("/v1/vms/{ID}"), Vec::new()),
+        ("POST", format!("/v1/vms/{ID}/start"), Vec::new()),
+        ("POST", format!("/v1/vms/{ID}/stop"), Vec::new()),
+        ("POST", format!("/v1/vms/{ID}/reboot"), Vec::new()),
+    ];
+    for (method, uri, body) in &routes {
+        // A missing or bad key is a 401, from any address.
+        for from in [Some(STAGE_SOURCE), Some(PROD_SOURCE), None] {
+            for auth in [None, Some("Bearer wrong"), Some("Basic stage-secret")] {
+                let sent = send_from(&h.app, method, uri, auth, from, body.clone()).await;
+                let want = StatusCode::UNAUTHORIZED;
+                assert_eq!(sent.0, want, "{method} {uri} {auth:?} from {from:?}");
+            }
+        }
+        // A valid key from an address that is not a source of its tenant is a 403.
+        for from in [Some(PROD_SOURCE), Some("203.0.113.9"), None] {
+            let sent = send_from(&h.app, method, uri, Some(STAGE), from, body.clone()).await;
+            let want = StatusCode::FORBIDDEN;
+            assert_eq!(sent.0, want, "{method} {uri} from {from:?}");
+            assert_eq!(
+                sent.1, br#"{"error":"forbidden"}"#,
+                "{method} {uri} from {from:?}"
+            );
+        }
+    }
+    // The refused requests changed nothing.
+    assert!(h.fake.launches().is_empty());
+    assert!(h.fake.actions().is_empty());
+    // From a source of the tenant no route refuses the key, so each route exists and the loops
+    // above tested it.
+    for (method, uri, body) in &routes {
+        let from = Some(STAGE_SOURCE);
+        let (status, _) = send_from(&h.app, method, uri, Some(STAGE), from, body.clone()).await;
+        let refused = [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN];
+        assert!(!refused.contains(&status), "{method} {uri} gave {status}");
+    }
+}
+
+#[tokio::test]
 async fn list_shows_only_live_vms_of_the_caller_sorted_by_name() {
     let h = harness().await;
     h.fake.seed(Instance {
@@ -416,7 +506,8 @@ async fn create_launches_a_tagged_vm_with_the_defaults() {
     assert_eq!(vm["setup"], "pending");
     assert_eq!(vm["instance_type"], "t3a.medium");
     assert_eq!(vm["sev_snp"], false);
-    assert_eq!(vm["public_ip"], Value::Null);
+    // The fake gives each VM that it launches a public IP.
+    assert_eq!(vm["public_ip"], "203.0.113.1");
     // The 201 shows the same VM that the list shows.
     let (_, listed) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
     assert_eq!(listed, json!([vm]));
@@ -859,11 +950,11 @@ async fn a_repeat_redeem_from_another_address_is_refused() {
     let h = harness().await;
     create(&h.app, STAGE, &create_body("lima")).await;
     let token = token_in(&h.fake.launches()[0].user_data);
-    let vm = "203.0.113.10";
-    assert_eq!(redeem_from(&h, &token, vm).await.0, StatusCode::OK);
+    let vm = vm_ip(&h, &token);
+    assert_eq!(redeem_from(&h, &token, &vm).await.0, StatusCode::OK);
     // Caddy appends the real address: an earlier entry, which the caller sent, does not count.
-    for other in ["198.51.100.7", "203.0.113.10, 198.51.100.7"] {
-        let (status, body) = redeem_from(&h, &token, other).await;
+    for other in ["198.51.100.7".to_owned(), format!("{vm}, 198.51.100.7")] {
+        let (status, body) = redeem_from(&h, &token, &other).await;
         assert_eq!(
             (status, body),
             (StatusCode::NOT_FOUND, not_found()),
@@ -876,6 +967,196 @@ async fn a_repeat_redeem_from_another_address_is_refused() {
         (status, body),
         (StatusCode::OK, create_body("lima")["bootstrap"].clone())
     );
+}
+
+#[tokio::test]
+async fn a_redeem_from_another_address_is_refused_and_keeps_the_token() {
+    let h = harness().await;
+    let (_, vm) = create(&h.app, STAGE, &create_body("lima")).await;
+    let id = vm["id"].as_str().unwrap();
+    let token = token_in(&h.fake.launches()[0].user_data);
+    let own = vm_ip(&h, &token);
+    // A thief that holds the token, from the address of a tenant, of a neighbor of the VM, of
+    // another range, and from IPv6. An entry that the thief puts before its own does not count.
+    for from in [
+        "198.51.100.7",
+        "192.0.2.10",
+        "203.0.113.2",
+        "2001:db8::1",
+        "::ffff:198.51.100.7",
+        &format!("{own}, 198.51.100.7"),
+    ] {
+        let (status, body) = redeem_from(&h, &token, from).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::NOT_FOUND, not_found()),
+            "{from}"
+        );
+    }
+    // Nothing was delivered or tagged, so the VM still has its token.
+    settle().await; // a tag call would run after the answer
+    assert!(!h.fake.instance(id).unwrap().setup_delivered);
+    let (_, listed) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
+    assert_eq!(listed[0]["setup"], "pending");
+    let (status, body) = redeem(&h, &token).await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::OK, create_body("lima")["bootstrap"].clone())
+    );
+}
+
+#[tokio::test]
+async fn a_redeem_without_a_usable_address_is_refused_and_keeps_the_token() {
+    let h = harness().await;
+    create(&h.app, STAGE, &create_body("lima")).await;
+    let token = token_in(&h.fake.launches()[0].user_data);
+    let auth = format!("Bearer {token}");
+    let own = vm_ip(&h, &token);
+    for from in [
+        None,
+        Some(""),
+        Some("unknown"),
+        Some("203.0.113.1,"),
+        Some(&format!("{own}:443")),
+    ] {
+        let (status, body) = call_from(&h.app, "POST", "/v1/bootstrap", Some(&auth), from).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::NOT_FOUND, not_found()),
+            "{from:?}"
+        );
+    }
+    assert_eq!(redeem(&h, &token).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_redeem_is_refused_while_the_vm_has_no_public_ip() {
+    let h = harness().await;
+    let (_, vm) = create(&h.app, STAGE, &create_body("lima")).await;
+    let id = vm["id"].as_str().unwrap();
+    let token = token_in(&h.fake.launches()[0].user_data);
+    let own = vm_ip(&h, &token);
+    h.fake.set_public_ip(id, None);
+    // No address is the VM's, its former one included.
+    for from in [own.as_str(), "198.51.100.7"] {
+        let (status, body) = redeem_from(&h, &token, from).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::NOT_FOUND, not_found()),
+            "{from}"
+        );
+    }
+    // The VM gets an address, and the token still works from it.
+    h.fake.set_public_ip(id, Some("198.51.100.8"));
+    assert_eq!(
+        redeem_from(&h, &token, "198.51.100.8").await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn a_redeem_is_refused_when_ec2_does_not_know_the_vm() {
+    let h = harness().await;
+    // The store has a token for an instance that EC2 does not list.
+    let store = &h.state.bootstrap;
+    store.insert(
+        "token",
+        empty_payload(),
+        "i-00000000000000ff",
+        "stage",
+        "ghost",
+    );
+    for from in ["203.0.113.1", "198.51.100.7"] {
+        let (status, body) = redeem_from(&h, "token", from).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::NOT_FOUND, not_found()),
+            "{from}"
+        );
+    }
+    // The failed attempts did not use the token up.
+    assert!(store.instance_of("token").is_some());
+}
+
+#[tokio::test]
+async fn a_token_works_only_from_its_own_vm() {
+    let h = harness().await;
+    create(&h.app, STAGE, &create_body("a")).await;
+    create(&h.app, STAGE, &create_body("b")).await;
+    let launches = h.fake.launches();
+    let (token_a, token_b) = (
+        token_in(&launches[0].user_data),
+        token_in(&launches[1].user_data),
+    );
+    let (ip_a, ip_b) = (vm_ip(&h, &token_a), vm_ip(&h, &token_b));
+    assert_ne!(ip_a, ip_b);
+    // Each VM presents the token of the other one.
+    for (token, from) in [(&token_a, &ip_b), (&token_b, &ip_a)] {
+        let (status, body) = redeem_from(&h, token, from).await;
+        assert_eq!((status, body), (StatusCode::NOT_FOUND, not_found()));
+    }
+    // Each VM still gets its own payload.
+    assert_eq!(redeem(&h, &token_a).await.0, StatusCode::OK);
+    assert_eq!(redeem(&h, &token_b).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_redeem_accepts_the_ipv4_mapped_forms_of_the_vm_address() {
+    let h = harness().await;
+    create(&h.app, STAGE, &create_body("lima")).await;
+    let token = token_in(&h.fake.launches()[0].user_data);
+    assert_eq!(vm_ip(&h, &token), "203.0.113.1");
+    // 203.0.113.1 is 0xcb007101.
+    for from in ["::ffff:203.0.113.1", "::ffff:cb00:7101", "203.0.113.1"] {
+        let (status, body) = redeem_from(&h, &token, from).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, create_body("lima")["bootstrap"].clone()),
+            "{from}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_token_does_not_reach_aws_and_an_aws_failure_is_a_502() {
+    let h = harness().await;
+    create(&h.app, STAGE, &create_body("lima")).await;
+    let token = token_in(&h.fake.launches()[0].user_data);
+    let own = vm_ip(&h, &token);
+    h.fake.fail(true);
+    // The store does not know these tokens, so there is no AWS call to fail: a 404, not a 502.
+    for auth in [Some("Bearer nope"), Some("Basic abc"), Some(STAGE), None] {
+        let (status, body) = call_from(&h.app, "POST", "/v1/bootstrap", auth, Some(&own)).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::NOT_FOUND, not_found()),
+            "{auth:?}"
+        );
+    }
+    // The holder of a live token reaches the lookup, and its failure is a 502 as everywhere else.
+    let (status, body) = redeem_from(&h, &token, &own).await;
+    assert_eq!((status, body), (StatusCode::BAD_GATEWAY, aws_failed()));
+    // The token is not used up: the VM asks again when AWS is back.
+    h.fake.fail(false);
+    assert_eq!(redeem_from(&h, &token, &own).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_vm_with_a_new_address_in_the_grace_time_is_refused() {
+    let h = harness().await;
+    let (_, vm) = create(&h.app, STAGE, &create_body("lima")).await;
+    let id = vm["id"].as_str().unwrap();
+    let token = token_in(&h.fake.launches()[0].user_data);
+    let first = vm_ip(&h, &token);
+    assert_eq!(redeem(&h, &token).await.0, StatusCode::OK);
+    // EC2 gives the VM a new address, as at a stop and a start. The new address is the VM's, but
+    // the first redeem came from another one.
+    h.fake.set_public_ip(id, Some("198.51.100.8"));
+    let (status, body) = redeem_from(&h, &token, "198.51.100.8").await;
+    assert_eq!((status, body), (StatusCode::NOT_FOUND, not_found()));
+    // The old address is not the VM's any more.
+    let (status, body) = redeem_from(&h, &token, &first).await;
+    assert_eq!((status, body), (StatusCode::NOT_FOUND, not_found()));
 }
 
 #[tokio::test]

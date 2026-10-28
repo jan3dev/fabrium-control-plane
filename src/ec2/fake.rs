@@ -84,6 +84,26 @@ impl FakeEc2 {
         self.inner().launches.clone()
     }
 
+    /// The instances that `launch` made, in order.
+    pub fn launched(&self) -> Vec<Instance> {
+        let inner = self.inner();
+        let find = |id: &String| inner.instances.iter().find(|i| i.id == *id);
+        inner
+            .launched_ids
+            .iter()
+            .filter_map(find)
+            .cloned()
+            .collect()
+    }
+
+    /// Sets or removes the public IP of an instance, as EC2 does at a stop and a start.
+    pub fn set_public_ip(&self, id: &str, ip: Option<&str>) {
+        let mut inner = self.inner();
+        let found = (inner.instances.iter_mut().find(|i| i.id == id))
+            .expect("a seeded or launched instance");
+        found.public_ip = ip.map(str::to_owned);
+    }
+
     pub fn actions(&self) -> Vec<(String, Action)> {
         self.inner().actions.clone()
     }
@@ -167,15 +187,22 @@ impl Ec2 for FakeEc2 {
         let (launched, delay) = {
             let mut inner = self.inner();
             ensure!(!inner.fail_writes, "fake EC2 write failure");
+            let n = inner.launches.len() + 1;
+            // The 254 addresses of 203.0.113.0/24 (RFC 5737), one for each launch: a test can tell
+            // the VMs apart. A launch after the last would repeat one.
+            ensure!(n < 255, "fake EC2 has no public IP left");
             // 17 hex digits, like EC2. The `fa` prefix keeps these apart from seeded ids.
-            let id = format!("i-fa{:015x}", inner.launches.len() + 1);
-            let launched = instance(
-                &id,
-                &launch.name,
-                Some(&launch.tenant),
-                "pending",
-                &launch.instance_type,
-            );
+            let id = format!("i-fa{n:015x}");
+            let launched = Instance {
+                public_ip: Some(format!("203.0.113.{n}")),
+                ..instance(
+                    &id,
+                    &launch.name,
+                    Some(&launch.tenant),
+                    "pending",
+                    &launch.instance_type,
+                )
+            };
             inner.instances.push(launched.clone());
             inner.launched_ids.push(id);
             inner.launches.push(launch.clone());
@@ -260,6 +287,70 @@ mod tests {
         assert_eq!(a.name, "a");
         assert_eq!(fake.launches().len(), 2);
         assert_eq!(fake.instance(&a.id).unwrap().name, "a");
+    }
+
+    #[tokio::test]
+    async fn launch_gives_each_instance_its_own_public_ip() {
+        let fake = FakeEc2::default();
+        let a = fake.launch(&launch("a")).await.unwrap();
+        let b = fake.launch(&launch("b")).await.unwrap();
+        // A documentation address (RFC 5737) for each launch. `get` and `list` show it too.
+        assert_eq!(a.public_ip.as_deref(), Some("203.0.113.1"));
+        assert_eq!(b.public_ip.as_deref(), Some("203.0.113.2"));
+        let got = fake.get(&b.id).await.unwrap().unwrap();
+        assert_eq!(got.public_ip.as_deref(), Some("203.0.113.2"));
+        let listed = fake.list("stage").await.unwrap();
+        assert_eq!(listed[0].public_ip.as_deref(), Some("203.0.113.1"));
+        // A seeded instance has the address that the test gives it: none.
+        fake.seed(instance(
+            "i-00000001",
+            "c",
+            Some("stage"),
+            "running",
+            "t3.medium",
+        ));
+        assert_eq!(fake.instance("i-00000001").unwrap().public_ip, None);
+    }
+
+    #[tokio::test]
+    async fn the_fake_has_254_public_ips_to_give() {
+        let fake = FakeEc2::default();
+        for _ in 0..254 {
+            fake.launch(&launch("a")).await.unwrap();
+        }
+        let last = fake.instances().pop().unwrap();
+        assert_eq!(last.public_ip.as_deref(), Some("203.0.113.254"));
+        // Another launch would repeat an address, so it fails.
+        assert!(fake.launch(&launch("b")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn set_public_ip_changes_one_instance() {
+        let fake = FakeEc2::default();
+        let a = fake.launch(&launch("a")).await.unwrap();
+        let b = fake.launch(&launch("b")).await.unwrap();
+        fake.set_public_ip(&a.id, None);
+        assert_eq!(fake.get(&a.id).await.unwrap().unwrap().public_ip, None);
+        fake.set_public_ip(&b.id, Some("198.51.100.9"));
+        let got = fake.get(&b.id).await.unwrap().unwrap();
+        assert_eq!(got.public_ip.as_deref(), Some("198.51.100.9"));
+        assert_eq!(fake.get(&a.id).await.unwrap().unwrap().public_ip, None);
+    }
+
+    #[tokio::test]
+    async fn launched_lists_the_instances_that_launch_made() {
+        let fake = FakeEc2::default();
+        fake.seed(instance(
+            "i-00000001",
+            "seeded",
+            Some("stage"),
+            "running",
+            "t3.medium",
+        ));
+        let a = fake.launch(&launch("a")).await.unwrap();
+        let b = fake.launch(&launch("b")).await.unwrap();
+        let ids: Vec<_> = fake.launched().into_iter().map(|i| i.id).collect();
+        assert_eq!(ids, [a.id, b.id]);
     }
 
     #[tokio::test]

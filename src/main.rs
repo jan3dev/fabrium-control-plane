@@ -26,7 +26,8 @@ async fn main() -> Result<()> {
         "vm settings"
     );
     let ec2 = Arc::new(AwsEc2::connect(vm).await);
-    let app = build_app(AppState::new(db, config.api_keys, config.vm, ec2));
+    let state = AppState::new(db, config.api_keys, config.api_sources, config.vm, ec2);
+    let app = build_app(state);
 
     let listener = TcpListener::bind(config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "listening");

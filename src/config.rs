@@ -2,7 +2,10 @@ use std::{env, net::SocketAddr};
 
 use anyhow::{Context, Result, ensure};
 
-use crate::{auth::ApiKeys, ec2};
+use crate::{
+    auth::{ApiKeys, ApiSources},
+    ec2,
+};
 
 const DEFAULT_INSTANCE_TYPES: &str =
     "t3a.medium,t3a.large,t3.medium,t3.large,m6a.large,c6a.large,r6a.large";
@@ -11,6 +14,8 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     pub database_url: String,
     pub api_keys: ApiKeys,
+    /// Where each tenant of `api_keys` may call from.
+    pub api_sources: ApiSources,
     pub vm: VmConfig,
 }
 
@@ -41,12 +46,17 @@ impl Config {
 
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let api_keys = get("API_KEYS").context("API_KEYS is not set")?;
+        let api_keys = ApiKeys::parse(&api_keys).context("invalid API_KEYS")?;
+        let api_sources = get("API_SOURCES").context("API_SOURCES is not set")?;
+        let api_sources =
+            ApiSources::parse(&api_sources, &api_keys).context("invalid API_SOURCES")?;
         Ok(Self {
             bind_addr: env_or(&get, "BIND_ADDR", "127.0.0.1:8080")
                 .parse()
                 .context("BIND_ADDR is not a valid socket address")?,
             database_url: env_or(&get, "DATABASE_URL", "sqlite://data/control-plane.db"),
-            api_keys: ApiKeys::parse(&api_keys).context("invalid API_KEYS")?,
+            api_keys,
+            api_sources,
             vm: VmConfig::from_lookup(&get)?,
         })
     }
@@ -125,6 +135,10 @@ mod tests {
     use super::*;
 
     const KEYS: &str = "a:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae";
+    /// `KEYS` and a second tenant, `b`.
+    const KEYS_AB: &str = "a:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae,\
+                           b:fcde2b2edba56bf408601fb721fe9b5c338d10ee429ea04fae5511b68fbf8fb9";
+    const SOURCES: &str = "a:192.0.2.0/24";
     const URL: &str = "https://cp.example.org";
 
     fn load_raw(vars: &[(&str, &str)]) -> Result<Config> {
@@ -135,15 +149,76 @@ mod tests {
         })
     }
 
-    /// `API_KEYS` and `PUBLIC_URL` are set unless the case overrides them.
+    /// `API_KEYS`, `API_SOURCES`, and `PUBLIC_URL` are set unless the case overrides them.
     fn load(vars: &[(&str, &str)]) -> Result<Config> {
-        load_raw(&[vars, &[("API_KEYS", KEYS), ("PUBLIC_URL", URL)]].concat())
+        let set = [
+            ("API_KEYS", KEYS),
+            ("API_SOURCES", SOURCES),
+            ("PUBLIC_URL", URL),
+        ];
+        load_raw(&[vars, &set].concat())
+    }
+
+    /// The text of the error of a load that must fail, with its causes.
+    fn load_error(vars: &[(&str, &str)]) -> String {
+        format!("{:#}", load(vars).err().expect("the load must fail"))
     }
 
     #[test]
     fn missing_or_empty_api_keys_fail() {
-        assert!(load_raw(&[("PUBLIC_URL", URL)]).is_err());
+        assert!(load_raw(&[("API_SOURCES", SOURCES), ("PUBLIC_URL", URL)]).is_err());
         assert!(load(&[("API_KEYS", "")]).is_err());
+    }
+
+    #[test]
+    fn api_sources_are_required() {
+        assert!(load_raw(&[("API_KEYS", KEYS), ("PUBLIC_URL", URL)]).is_err());
+        for empty in ["", " , "] {
+            assert!(load(&[("API_SOURCES", empty)]).is_err(), "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn api_sources_are_loaded_for_each_tenant() {
+        let sources = "a:192.0.2.0/24, a:2001:db8::1, b:198.51.100.7";
+        let c = load(&[("API_KEYS", KEYS_AB), ("API_SOURCES", sources)]).unwrap();
+        let allows = |tenant: &str, addr: &str| c.api_sources.allows(tenant, addr.parse().unwrap());
+        assert!(allows("a", "192.0.2.77") && allows("a", "2001:db8::1"));
+        assert!(allows("b", "198.51.100.7"));
+        assert!(!allows("a", "198.51.100.7") && !allows("b", "192.0.2.77"));
+    }
+
+    #[test]
+    fn api_sources_must_match_the_tenants_of_the_keys() {
+        // Tenant `b` has no source.
+        let vars = [("API_KEYS", KEYS_AB), ("API_SOURCES", "a:192.0.2.1")];
+        assert!(load(&vars).is_err());
+        // A source names a tenant that the keys do not have.
+        assert!(load(&[("API_SOURCES", "a:192.0.2.1,b:192.0.2.2")]).is_err());
+        assert!(load(&[("API_SOURCES", "b:192.0.2.2")]).is_err());
+    }
+
+    #[test]
+    fn api_sources_errors_name_the_variable_and_the_entry() {
+        let cases = [
+            ("", "API_SOURCES is empty"),
+            ("a:192.0.2.256", "\"a:192.0.2.256\""),
+            ("a:192.0.2.5/24", "\"a:192.0.2.5/24\""),
+            ("a:192.0.2.1,b:192.0.2.2", "tenant \"b\""),
+        ];
+        for (sources, want) in cases {
+            let err = load_error(&[("API_SOURCES", sources)]);
+            assert!(
+                err.contains("invalid API_SOURCES") && err.contains(want),
+                "{sources:?}: {err}"
+            );
+        }
+        let vars = [("API_KEYS", KEYS_AB), ("API_SOURCES", "a:192.0.2.1")];
+        let err = load_error(&vars);
+        assert!(err.contains("tenant \"b\""), "{err}");
+        // The variable is missing, not empty.
+        let err = format!("{:#}", load_raw(&[("API_KEYS", KEYS)]).err().unwrap());
+        assert!(err.contains("API_SOURCES is not set"), "{err}");
     }
 
     #[test]
@@ -171,7 +246,7 @@ mod tests {
 
     #[test]
     fn public_url_is_required() {
-        assert!(load_raw(&[("API_KEYS", KEYS)]).is_err());
+        assert!(load_raw(&[("API_KEYS", KEYS), ("API_SOURCES", SOURCES)]).is_err());
         assert!(load(&[("PUBLIC_URL", "")]).is_err());
     }
 

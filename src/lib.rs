@@ -32,6 +32,8 @@ const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 pub struct AppState {
     pub db: DatabaseConnection,
     pub api_keys: Arc<auth::ApiKeys>,
+    /// Where each tenant of `api_keys` may call from.
+    pub api_sources: Arc<auth::ApiSources>,
     pub vm: Arc<config::VmConfig>,
     pub ec2: Arc<dyn ec2::Ec2>,
     pub bootstrap: Arc<bootstrap::Store>,
@@ -45,12 +47,14 @@ impl AppState {
     pub fn new(
         db: DatabaseConnection,
         api_keys: auth::ApiKeys,
+        api_sources: auth::ApiSources,
         vm: config::VmConfig,
         ec2: Arc<dyn ec2::Ec2>,
     ) -> Self {
         Self {
             db,
             api_keys: Arc::new(api_keys),
+            api_sources: Arc::new(api_sources),
             vm: Arc::new(vm),
             ec2,
             bootstrap: Arc::new(bootstrap::Store::new(bootstrap::TTL)),

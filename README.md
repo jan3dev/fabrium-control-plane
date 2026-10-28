@@ -28,10 +28,11 @@ The control plane launches and manages the agent VMs of each tenant on AWS EC2. 
 
    ```sh
    API_KEYS=stage:<hash>
+   API_SOURCES=stage:192.0.2.10
    PUBLIC_URL=https://localhost
    ```
 
-   `PUBLIC_URL` must be an https URL. A VM can redeem its token only if the URL is the real, public one. The VM routes also need AWS credentials. See [Configuration](#configuration).
+   `API_SOURCES` lists the addresses that `stage` calls from. The example uses a documentation address. Step 6 sends the same address in `X-Forwarded-For`, because the quick start has no proxy. `PUBLIC_URL` must be an https URL. A VM can redeem its token only if the URL is the real, public one. The VM routes also need AWS credentials. See [Configuration](#configuration).
 
 5. Start the service. The first build needs a lot of memory. See [Build memory](#build-memory).
 
@@ -45,7 +46,7 @@ The control plane launches and manages the agent VMs of each tenant on AWS EC2. 
    curl -i localhost:8080/health
    # 200 {"status":"ok"}
 
-   curl -i -H "Authorization: Bearer $KEY" localhost:8080/v1/ping
+   curl -i -H "Authorization: Bearer $KEY" -H "X-Forwarded-For: 192.0.2.10" localhost:8080/v1/ping
    # 200 {"pong":true,"client":"stage"}
    ```
 
@@ -56,6 +57,7 @@ The database lives in the `data` Docker volume. It survives restarts.
 | Variable | Default | Docker value | Notes |
 |----------|---------|--------------|-------|
 | `API_KEYS` | none (required) | from `.env` | Comma-separated `<tenant>:<sha256-hex>` pairs. A tenant name uses only `a-z`, `0-9`, and `-`, because it becomes the value of the `fabrium:tenant` tag. The service refuses to start if the variable is missing, empty, or malformed, if a name is not valid, or if two entries share a name or a hash. |
+| `API_SOURCES` | none (required) | from `.env` | Comma-separated `<tenant>:<ip-or-cidr>` entries, for example `stage:203.0.113.7,stage:198.51.100.0/24`. A tenant can have several entries. A bare IP is one host. While `CP_HOST` has only an A record, every caller reaches the control plane over IPv4. If you add an AAAA record, list the IPv6 addresses of the callers too. The key of a tenant works only from the addresses of that tenant (see [API](#api)). A CIDR range must start at its network address: `192.0.2.0/24`, not `192.0.2.5/24`. The service refuses to start if the variable is missing, empty, or malformed, if an entry has a prefix of 0 (it allows every address), if an entry is an IPv4-mapped IPv6 address such as `::ffff:192.0.2.7` (it never matches: write the IPv4 form), if an entry names a tenant that `API_KEYS` does not have, or if a tenant of `API_KEYS` has no entry. |
 | `PUBLIC_URL` | none (required) | from `.env` | The base URL that VMs use to redeem their token. It must start with `https://` and must not hold a quote or a space. The service removes a trailing `/`. |
 | `AWS_REGION` | `us-east-2` | from `.env` | AWS has SEV-SNP on shared tenancy only in `us-east-2` and `eu-west-1`. In another region, the service refuses to start if `INSTANCE_TYPES` has a SEV-SNP type. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | none | from `.env` | The AWS SDK reads them from the environment. Temporary credentials expire. Put new ones in `.env` and recreate the container. |
@@ -82,7 +84,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-`cargo run` needs `API_KEYS` and `PUBLIC_URL` in your environment or in `.env`. The tests use an in-memory fake of EC2 and canned EC2 responses. They need no AWS account and no network.
+`cargo run` needs `API_KEYS`, `API_SOURCES`, and `PUBLIC_URL` in your environment or in `.env`. The tests use an in-memory fake of EC2 and canned EC2 responses. They need no AWS account and no network.
 
 ## Migrations
 
@@ -100,10 +102,12 @@ The CLI reads `DATABASE_URL`. There are no migrations yet. Generate entities lat
 
 Every route except `/health` and `/v1/bootstrap` needs `Authorization: Bearer <tenant API key>`. The server hashes the key with SHA-256 and compares it with the stored hashes. The scheme name is case-insensitive, and extra spaces before the key are ignored. A missing header, a wrong scheme, or an unknown key returns `401` with `WWW-Authenticate: Bearer` and `{"error":"missing or invalid API key"}`.
 
+A valid key also needs a source address. The address is the last `X-Forwarded-For` entry, which Caddy sets. Caddy is the only way in, so that entry is the real client (see [Deploy on the control host](#deploy-on-the-control-host)). An IPv4-mapped IPv6 address counts as its IPv4 address. The service checks the address against the `API_SOURCES` entries of the tenant of the key. A request from another address, or with no usable address, returns `403 {"error":"forbidden"}`, and the service logs a warning with the tenant and the address. The key check comes first, so a bad key always returns `401`.
+
 | Method | Path | Success | Errors |
 |--------|------|---------|--------|
 | GET | `/health` | `200 {"status":"ok"}` | `503 {"status":"unavailable"}` if the database does not answer |
-| GET | `/v1/ping` | `200 {"pong":true,"client":"<tenant>"}` | `401` |
+| GET | `/v1/ping` | `200 {"pong":true,"client":"<tenant>"}` | `401`, `403` |
 | GET | `/v1/instance-types` | `200 [type]` | `502` |
 | GET | `/v1/vms` | `200 [vm]`, sorted by `name` | `502` |
 | POST | `/v1/vms` | `201 vm` | `400`, `409`, `413`, `502` |
@@ -111,7 +115,7 @@ Every route except `/health` and `/v1/bootstrap` needs `Authorization: Bearer <t
 | POST | `/v1/vms/{id}/stop` | `202 vm` | `404`, `409`, `502` |
 | POST | `/v1/vms/{id}/reboot` | `202 vm` | `404`, `409`, `502` |
 | DELETE | `/v1/vms/{id}` | `202`, empty body | `404`, `502` |
-| POST | `/v1/bootstrap` | `200 {"files":[...],"script":"..."}` | `404` |
+| POST | `/v1/bootstrap` | `200 {"files":[...],"script":"..."}` | `404`, `502` |
 
 Every error body is `{"error":"<short message>"}`. A `413` can have a plain-text body. Clients must branch on the status code, not on the message.
 
@@ -192,9 +196,13 @@ A failed AWS call gives `502 {"error":"aws request failed"}`. The AWS detail goe
 
 The user data of a new VM is a short script with the public URL and a token. The token is 32 random bytes in base64url. The service keeps only its SHA-256, with the payload, in memory for 15 minutes.
 
-The VM sends `POST /v1/bootstrap` with `Authorization: Bearer <token>`. The service returns the payload, then sets the tag `fabrium:setup=delivered` on the instance. A failed or slow tag (5 s limit) is logged, and the VM still gets its payload.
+The VM sends `POST /v1/bootstrap` with `Authorization: Bearer <token>`. The token works only from the public IPv4 address of its own VM. The service finds the instance that owns the token, reads the public IP of that instance from EC2, and compares it with the address of the caller. The address is the last `X-Forwarded-For` entry, which Caddy sets: it is the real client (see [Deploy on the control host](#deploy-on-the-control-host)). If the two match, the service returns the payload, then sets the tag `fabrium:setup=delivered` on the instance. A failed or slow tag (5 s limit) is logged, and the VM still gets its payload.
 
-For 60 s after the first redeem, a repeat from the same address gets the same payload, so a VM whose first answer got lost can ask again. The address is the last `X-Forwarded-For` entry, which Caddy sets: the service listens on localhost only. A repeat from another address gets `404`, and the service logs a warning with both addresses: the token reached someone else than the VM. An unknown token, an expired token, a token after its 60 s, and a missing header also give `404 {"error":"not found"}`. The token is not a tenant API key, and a tenant API key is not a token.
+A request from another address, a request with no usable address, and a request while EC2 shows no public IP for the VM all get `404`. The service logs a warning with the VM and the addresses, and it keeps the token: a thief that holds the token gets nothing, and the VM can still redeem it.
+
+A VM needs a public IPv4 address, so launch VMs in a subnet that assigns one. The default VPC subnet does, and the service sets no subnet. A VM behind a NAT gateway calls from the address of the gateway, so it never gets its payload.
+
+For 60 s after the first redeem, a repeat from the same address gets the same payload, so a VM whose first answer got lost can ask again. A repeat from another address gets `404`, and the service logs a warning with both addresses: the public IP of the VM changed after its first redeem. An unknown token, an expired token, a token after its 60 s, and a missing header also give `404 {"error":"not found"}`. A token that the service does not know costs no EC2 call. If the EC2 lookup fails for a live token, the answer is `502`, and the VM asks again. The token is not a tenant API key, and a tenant API key is not a token.
 
 A restart of the service loses the payloads that no VM redeemed yet. Those VMs show `expired`.
 
@@ -235,7 +243,7 @@ The `control` instance has 1.9 GiB of RAM, and the build of the image needs more
    cd fabrium-control-plane
    ```
 
-4. Create `.env` and set every variable of [Configuration](#configuration) that has no default: `API_KEYS`, `PUBLIC_URL`, `CP_HOST`, and the AWS credentials. `PUBLIC_URL` is `https://` plus `CP_HOST`.
+4. Create `.env` and set every variable of [Configuration](#configuration) that has no default: `API_KEYS`, `API_SOURCES`, `PUBLIC_URL`, `CP_HOST`, and the AWS credentials. `PUBLIC_URL` is `https://` plus `CP_HOST`. Set `API_SOURCES` to the public IP of the zooid host of each tenant before you deploy. A tenant whose zooid host is not in the list gets `403` on every call.
 
    ```sh
    cp .env.example .env
@@ -253,9 +261,11 @@ The `control` instance has 1.9 GiB of RAM, and the build of the image needs more
    curl -i https://<host>/health
    ```
 
-To update, build a new tag, load it on the host, and run step 5 with the new tag. If the Compose files changed, update the clone on the host first.
+To update, build a new tag, load it on the host, and run step 5 with the new tag. If the Compose files changed, update the clone on the host first. From the version that added the source checks, `API_SOURCES` is required. Set it in `.env` before you update: without it the service refuses to start, so the container exits and `restart: unless-stopped` restarts it in a loop.
 
 `compose.caddy.yaml` adds the `caddy` service on the ports 80 and 443, with the named volumes `caddy_data` and `caddy_config`. The `Caddyfile` sends every request to `control-plane:8080`. Caddy sees only `CP_HOST`, not the AWS keys.
+
+Caddy must stay the only way in. The source checks trust the last `X-Forwarded-For` entry, and the `Caddyfile` sets that header to the address of the client (`header_up X-Forwarded-For {remote_host}`). The container binds `0.0.0.0:8080`. Compose publishes the port on the host loopback (`127.0.0.1`) only, and Caddy is the only other service on the Compose network. So only Caddy and the users of the host can reach the port, and the last entry is the real client. A client that reached the port directly could send any address. Do not publish the port on another interface, do not open it in the firewall, and do not add a service to the Compose network.
 
 ### Build memory
 
