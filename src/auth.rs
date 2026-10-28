@@ -81,6 +81,10 @@ pub enum SourcesError {
     Malformed(String),
     #[error("API_SOURCES entry {0:?} is a range that does not start at its network address")]
     HostBits(String),
+    #[error("API_SOURCES entry {0:?} is IPv4-mapped IPv6, which never matches: use the IPv4 form")]
+    Ipv4Mapped(String),
+    #[error("API_SOURCES entry {0:?} has a prefix of 0, which allows every address")]
+    PrefixZero(String),
     #[error("API_SOURCES names the tenant {0:?}, which API_KEYS does not have")]
     UnknownTenant(String),
     #[error("API_KEYS has the tenant {0:?}, which has no entry in API_SOURCES")]
@@ -108,6 +112,14 @@ impl ApiSources {
             if net.addr() != net.network() {
                 return Err(SourcesError::HostBits(entry.to_owned()));
             }
+            // `client_address` makes a mapped client an IPv4 address, so a mapped range never matches.
+            if is_ipv4_mapped(&net) {
+                return Err(SourcesError::Ipv4Mapped(entry.to_owned()));
+            }
+            // A prefix of 0 allows every address. It would turn the check off for the tenant.
+            if net.prefix_len() == 0 {
+                return Err(SourcesError::PrefixZero(entry.to_owned()));
+            }
             if !keys.0.iter().any(|(name, _)| name == tenant) {
                 return Err(SourcesError::UnknownTenant(tenant.to_owned()));
             }
@@ -130,9 +142,22 @@ impl ApiSources {
     }
 }
 
-/// A CIDR range, or a bare address as a range of one host.
+/// A CIDR range, or a bare address as a range of one host. The address follows the rules of
+/// `std::net::IpAddr`: for example, an IPv4 octet has no leading zero.
 fn parse_net(s: &str) -> Option<IpNet> {
-    (s.parse::<IpNet>().ok()).or_else(|| s.parse::<IpAddr>().ok().map(IpNet::from))
+    let Some((addr, prefix)) = s.split_once('/') else {
+        return s.parse::<IpAddr>().ok().map(IpNet::from);
+    };
+    // `u8` takes a leading `+` too. A prefix is digits only.
+    if !prefix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    IpNet::new(addr.parse().ok()?, prefix.parse().ok()?).ok()
+}
+
+/// True for a range inside `::ffff:0:0/96`, the IPv4-mapped IPv6 addresses.
+fn is_ipv4_mapped(net: &IpNet) -> bool {
+    matches!(net, IpNet::V6(n) if n.prefix_len() >= 96 && n.network().to_ipv4_mapped().is_some())
 }
 
 #[derive(Clone, Debug)]
@@ -325,10 +350,12 @@ mod tests {
 
     #[test]
     fn sources_accept_the_edges_of_the_prefix_rules() {
-        let s = parse_with("zooid:0.0.0.0/0").unwrap();
+        // The widest range that a source may be has a prefix of 1. A prefix of 0 is refused.
+        let s = parse_with("zooid:128.0.0.0/1").unwrap();
         assert!(s.allows("zooid", ip("203.0.113.9")) && !s.allows("other", ip("203.0.113.9")));
-        let s = parse_with("other:::/0").unwrap();
+        let s = parse_with("other:::/1").unwrap();
         assert!(s.allows("other", ip("2001:db8::9")) && !s.allows("zooid", ip("2001:db8::9")));
+        // The narrowest is one host.
         assert!(parse_with("zooid:192.0.2.5/32").is_ok());
         assert!(parse_with("zooid:2001:db8::5/128").is_ok());
     }
@@ -346,6 +373,10 @@ mod tests {
             "zooid:/24",
             "zooid:192.0.2.0/-1",
             "zooid:192.0.2.0/ 24",
+            // A prefix is digits only, and it fits in a `u8`.
+            "zooid:192.0.2.0/+24",
+            "zooid:2001:db8::/+32",
+            "zooid:192.0.2.0/256",
             "zooid:2001:db8::/129",
             "zooid:2001:db8::g",
             "zooid:192.0.2.1:8080",
@@ -353,6 +384,61 @@ mod tests {
         ] {
             assert!(
                 matches!(parse_with(bad), Err(SourcesError::Malformed(e)) if e == bad),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sources_reject_zero_padded_octets() {
+        // The standard library refuses `010`, which some tools read as octal. So do the sources,
+        // with a prefix and without one.
+        for bad in [
+            "zooid:198.51.100.010/32",
+            "zooid:198.51.100.010",
+            "zooid:198.051.100.10/24",
+            "zooid:198.51.100.00/24",
+            "zooid:::ffff:198.51.100.010/128",
+        ] {
+            assert!(
+                matches!(parse_with(bad), Err(SourcesError::Malformed(e)) if e == bad),
+                "{bad:?}"
+            );
+        }
+        // A single `0` is not padded.
+        assert!(parse_with("zooid:198.51.100.0/24").is_ok());
+    }
+
+    #[test]
+    fn sources_reject_ipv4_mapped_entries() {
+        // `client_address` makes a mapped client an IPv4 address, so these never match.
+        for bad in [
+            "zooid:::ffff:192.0.2.7",
+            "zooid:::ffff:c000:207",
+            "zooid:::ffff:192.0.2.7/128",
+            "zooid:::ffff:192.0.2.0/120",
+            "zooid:::ffff:0:0/96",
+        ] {
+            assert!(
+                matches!(parse_with(bad), Err(SourcesError::Ipv4Mapped(e)) if e == bad),
+                "{bad:?}"
+            );
+        }
+        // A range that holds other IPv6 addresses too can match them.
+        for ok in ["zooid:::/80", "zooid:2001:db8::/96", "zooid:2001:db8::5"] {
+            assert!(parse_with(ok).is_ok(), "{ok:?}");
+        }
+        // The IPv4 form is the one to write.
+        let s = parse_with("zooid:192.0.2.0/24").unwrap();
+        assert!(s.allows("zooid", ip("192.0.2.7")));
+    }
+
+    #[test]
+    fn sources_reject_a_prefix_of_zero() {
+        // It allows every address, so it turns the check off for the tenant.
+        for bad in ["zooid:0.0.0.0/0", "zooid:::/0"] {
+            assert!(
+                matches!(parse_with(bad), Err(SourcesError::PrefixZero(e)) if e == bad),
                 "{bad:?}"
             );
         }
