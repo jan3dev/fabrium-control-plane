@@ -96,11 +96,11 @@ cargo run -p migration -- down
 cargo run -p migration -- status
 ```
 
-The CLI reads `DATABASE_URL`. The service runs the migrations at start. The database holds the VM registry (see [Auto-stop](#auto-stop)), the agent records (see [Agents](#agents)), and the projects (see [Projects](#projects)); in Docker it is in the named volume `data`, which survives a new image.
+The CLI reads `DATABASE_URL`. The service runs the migrations at start. The database holds the VM registry (see [Auto-stop](#auto-stop)), the agent records (see [Agents](#agents)), and the projects (see [Projects](#projects)); in Docker it is in the named volume `data`, which survives a new image. Migrations also create `github_deliveries` and `factory_runs` when the factory is used. Generate further entities later with `sea-orm-cli`.
 
 ## API
 
-Every route except `/health`, `/v1/bootstrap`, `/v1/vm/auto-stop`, and `/v1/vm/agents` needs `Authorization: Bearer <tenant API key>`. The server hashes the key with SHA-256 and compares it with the stored hashes. The scheme name is case-insensitive, and extra spaces before the key are ignored. A missing header, a wrong scheme, or an unknown key returns `401` with `WWW-Authenticate: Bearer` and `{"error":"missing or invalid API key"}`.
+Every route except `/health`, `/v1/bootstrap`, `/v1/vm/auto-stop`, `/v1/vm/agents`, and `/v1/github/webhook` needs `Authorization: Bearer <tenant API key>`. The server hashes the key with SHA-256 and compares it with the stored hashes. The scheme name is case-insensitive, and extra spaces before the key are ignored. A missing header, a wrong scheme, or an unknown key returns `401` with `WWW-Authenticate: Bearer` and `{"error":"missing or invalid API key"}`. The GitHub webhook uses `X-Hub-Signature-256` instead; see [docs/tech/agent-factory/listener.md](docs/tech/agent-factory/listener.md).
 
 A valid key also needs a source address. The address is the last `X-Forwarded-For` entry, which Caddy sets. Caddy is the only way in, so that entry is the real client (see [Deploy on the control host](#deploy-on-the-control-host)). An IPv4-mapped IPv6 address counts as its IPv4 address. The service checks the address against the `API_SOURCES` entries of the tenant of the key. A request from another address, or with no usable address, returns `403 {"error":"forbidden"}`, and the service logs a warning with the tenant and the address. The key check comes first, so a bad key always returns `401`.
 
@@ -129,6 +129,7 @@ A valid key also needs a source address. The address is the last `X-Forwarded-Fo
 | POST | `/v1/bootstrap` | `200 {"files":[...],"script":"..."}` | `404`, `502` |
 | GET | `/v1/vm/auto-stop` | `200 {"auto_stop_hours":N}` | `404` |
 | GET | `/v1/vm/agents` | `200 {"agents":[...]}` | `404` |
+| POST | `/v1/github/webhook` | `200 {"ok":true,…}` (GitHub App HMAC; no tenant key) | `403` bad signature, `404` if factory unset |
 
 Every error body is `{"error":"<short message>"}`. A `413` can have a plain-text body. Clients must branch on the status code, not on the message.
 
