@@ -18,7 +18,7 @@ use crate::{
 /// The longest that the tag call runs.
 const TAG_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `POST /v1/bootstrap`: a new VM redeems its token. No tenant key. 
+/// `POST /v1/bootstrap`: a new VM redeems its token. No tenant key.
 pub async fn redeem(
     State(state): State<AppState>,
     headers: HeaderMap,

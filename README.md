@@ -94,11 +94,11 @@ cargo run -p migration -- down
 cargo run -p migration -- status
 ```
 
-The CLI reads `DATABASE_URL`. There are no migrations yet. Generate entities later with `sea-orm-cli`.
+The CLI reads `DATABASE_URL`. Migrations create `github_deliveries` and `factory_runs` when the factory is used. Generate further entities later with `sea-orm-cli`.
 
 ## API
 
-Every route except `/health` and `/v1/bootstrap` needs `Authorization: Bearer <tenant API key>`. The server hashes the key with SHA-256 and compares it with the stored hashes. The scheme name is case-insensitive, and extra spaces before the key are ignored. A missing header, a wrong scheme, or an unknown key returns `401` with `WWW-Authenticate: Bearer` and `{"error":"missing or invalid API key"}`.
+Every route except `/health`, `/v1/bootstrap`, and `/v1/github/webhook` needs `Authorization: Bearer <tenant API key>`. The server hashes the key with SHA-256 and compares it with the stored hashes. The scheme name is case-insensitive, and extra spaces before the key are ignored. A missing header, a wrong scheme, or an unknown key returns `401` with `WWW-Authenticate: Bearer` and `{"error":"missing or invalid API key"}`. The GitHub webhook uses `X-Hub-Signature-256` instead; see [docs/tech/agent-factory/listener.md](docs/tech/agent-factory/listener.md).
 
 | Method | Path | Success | Errors |
 |--------|------|---------|--------|
@@ -112,6 +112,7 @@ Every route except `/health` and `/v1/bootstrap` needs `Authorization: Bearer <t
 | POST | `/v1/vms/{id}/reboot` | `202 vm` | `404`, `409`, `502` |
 | DELETE | `/v1/vms/{id}` | `202`, empty body | `404`, `502` |
 | POST | `/v1/bootstrap` | `200 {"files":[...],"script":"..."}` | `404` |
+| POST | `/v1/github/webhook` | `200 {"ok":true,…}` (GitHub App HMAC; no tenant key) | `403` bad signature, `404` if factory unset |
 
 Every error body is `{"error":"<short message>"}`. A `413` can have a plain-text body. Clients must branch on the status code, not on the message.
 
