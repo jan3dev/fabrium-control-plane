@@ -280,3 +280,9 @@ The compiler alone peaks at 8.3 GiB, so a machine with 8 GiB of RAM is not enoug
 - No `iam:PassRole`, because VMs get no instance profile.
 
 The code enforces tenant isolation. IAM keeps the control plane away from every instance that Fabrium did not launch or adopt.
+
+## Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/test-webhook.sh` | Test the GitHub webhook endpoint with a signed payload. Run `./scripts/test-webhook.sh <CP_HOST> <WEBHOOK_SECRET> [event_type]` |

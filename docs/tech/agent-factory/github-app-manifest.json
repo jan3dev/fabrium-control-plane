@@ -1,0 +1,25 @@
+{
+  "name": "Fabrium Factory",
+  "url": "https://github.com/emjshrx/fabrium-control-plane",
+  "hook_attributes": {
+    "url": "https://YOUR_CP_HOST/v1/github/webhook",
+    "active": true
+  },
+  "redirect_url": "",
+  "callback_urls": [],
+  "setup_url": "",
+  "description": "Agent factory dispatcher: receives GitHub events to drive issue-to-PR automation with zooid agents. Replace YOUR_CP_HOST in the webhook URL with your control plane host before you create the app.",
+  "public": false,
+  "default_events": [
+    "issues",
+    "issue_comment",
+    "check_suite",
+    "pull_request"
+  ],
+  "default_permissions": {
+    "issues": "write",
+    "checks": "read",
+    "pull_requests": "read",
+    "metadata": "read"
+  }
+}
