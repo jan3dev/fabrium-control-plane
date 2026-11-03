@@ -119,7 +119,7 @@ async fn record_delivery(db: &sea_orm::DatabaseConnection, id: &str) -> Result<b
         .filter(github_deliveries::Column::Id.eq(id))
         .one(db)
         .await
-        .map_err(|e| AppError::Aws(format!("delivery lookup: {e}")))?;
+        .map_err(|e| AppError::Db(format!("delivery lookup: {e}")))?;
     if existing.is_some() {
         return Ok(false);
     }
@@ -130,13 +130,15 @@ async fn record_delivery(db: &sea_orm::DatabaseConnection, id: &str) -> Result<b
     match row.insert(db).await {
         Ok(_) => Ok(true),
         Err(e) if is_unique_violation(&e) => Ok(false),
-        Err(e) => Err(AppError::Aws(format!("delivery insert: {e}"))),
+        Err(e) => Err(AppError::Db(format!("delivery insert: {e}"))),
     }
 }
 
 fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
-    let s = err.to_string();
-    s.contains("UNIQUE") || s.contains("unique") || s.contains("2067")
+    matches!(
+        err.sql_err(),
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+    )
 }
 
 fn repo_full_name(payload: &Value) -> Option<&str> {

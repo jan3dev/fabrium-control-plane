@@ -68,6 +68,14 @@ The database lives in the `data` Docker volume. It survives restarts.
 | `BIND_ADDR` | `127.0.0.1:8080` | `0.0.0.0:8080` | Set by the image. |
 | `DATABASE_URL` | `sqlite://data/control-plane.db` | `sqlite:///data/control-plane.db` | Set by the image. The service creates the file and its directory. |
 | `RUST_LOG` | `info` | from `.env` | Log filter. At `trace`, the AWS SDK logs whole requests, and the launch request holds the token of the new VM in its user data. Keep `info` in production. |
+| `GITHUB_APP_ID` | none (factory) | from `.env` | The GitHub App id of the agent factory. The factory variables are all or none: the service refuses to start when some are set and others are missing. |
+| `GITHUB_APP_PRIVATE_KEY` or `GITHUB_APP_PRIVATE_KEY_FILE` | none (factory) | `GITHUB_APP_PRIVATE_KEY_FILE=/run/secrets/github-app.pem` via `compose.factory.yaml` | The App private key. Inline PEM text in `GITHUB_APP_PRIVATE_KEY` (newlines written as `\n`), or a PEM file path in `GITHUB_APP_PRIVATE_KEY_FILE`. The Compose file mounts `./github-app.pem` read-only at the path that it sets. |
+| `GITHUB_WEBHOOK_SECRET` | none (factory) | from `.env` | The webhook secret of the App. `POST /v1/github/webhook` checks the signature with it. |
+| `FACTORY_REPOS` | none (factory) | from `.env` | Comma-separated `owner/name` entries. The service ignores webhooks for other repositories. The name check ignores case. |
+| `MATRIX_HOMESERVER` | none (factory) | from `.env` | The Matrix homeserver base URL. `http://` or `https://`. |
+| `MATRIX_ACCESS_TOKEN` | none (factory) | from `.env` | The access token of the bot account. |
+| `MATRIX_IMPLEMENTER` | none (factory) | from `.env` | The Matrix user id of the implementer. |
+| `MATRIX_REVIEWER` | none (factory) | from `.env` | The Matrix user id of the reviewer. |
 
 An empty value counts as not set. A `.env` file in the working directory is loaded automatically for local runs.
 
@@ -236,13 +244,13 @@ The `control` instance has 1.9 GiB of RAM, and the build of the image needs more
    cd fabrium-control-plane
    ```
 
-4. Create `.env` and set every variable of [Configuration](#configuration) that has no default: `API_KEYS`, `PUBLIC_URL`, `CP_HOST`, and the AWS credentials. `PUBLIC_URL` is `https://` plus `CP_HOST`.
+4. Create `.env` and set every variable of [Configuration](#configuration) that has no default: `API_KEYS`, `PUBLIC_URL`, `CP_HOST`, and the AWS credentials. `PUBLIC_URL` is `https://` plus `CP_HOST`. For the agent factory, set the factory variables too, and put the App key next to the Compose files as `github-app.pem`, readable by the container user: `chown 65532:65532 github-app.pem && chmod 400 github-app.pem`.
 
    ```sh
    cp .env.example .env
    ```
 
-5. Start the service and Caddy with the image that you loaded. `--no-build` keeps Compose from building on the host.
+5. Start the service and Caddy with the image that you loaded. `--no-build` keeps Compose from building on the host. With the agent factory, add `-f compose.factory.yaml` to the command.
 
    ```sh
    CP_TAG=<tag> docker compose -f compose.yaml -f compose.caddy.yaml up -d --no-build
@@ -256,7 +264,19 @@ The `control` instance has 1.9 GiB of RAM, and the build of the image needs more
 
 To update, build a new tag, load it on the host, and run step 5 with the new tag. If the Compose files changed, update the clone on the host first.
 
+Migrations run at startup and only go forward. SeaORM refuses to start when the database holds a migration that the image does not know, so a rollback needs a database from before the update. Back the database up before every update, and keep the file:
+
+```sh
+docker compose -f compose.yaml stop control-plane
+docker compose -f compose.yaml cp control-plane:/data/control-plane.db control-plane-$(date +%F).db
+docker compose -f compose.yaml start
+```
+
+To roll back, copy the file back into the stopped container and run step 5 with the old tag.
+
 `compose.caddy.yaml` adds the `caddy` service on the ports 80 and 443, with the named volumes `caddy_data` and `caddy_config`. The `Caddyfile` sends every request to `control-plane:8080`. Caddy sees only `CP_HOST`, not the AWS keys.
+
+`compose.factory.yaml` adds the agent factory to `control-plane`: it sets `GITHUB_APP_PRIVATE_KEY_FILE` and mounts `./github-app.pem` read-only at that path.
 
 ### Build memory
 

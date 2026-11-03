@@ -20,6 +20,9 @@ pub enum AppError {
     /// The detail is for the log. The body says only that the request failed.
     #[error("aws request failed")]
     Aws(String),
+    /// Same contract as `Aws`, but for our own database, so 500, not 502.
+    #[error("database request failed")]
+    Db(String),
 }
 
 impl From<anyhow::Error> for AppError {
@@ -45,6 +48,10 @@ impl IntoResponse for AppError {
             Self::Aws(detail) => {
                 tracing::error!(%detail, "aws request failed");
                 (StatusCode::BAD_GATEWAY, body).into_response()
+            }
+            Self::Db(detail) => {
+                tracing::error!(%detail, "database request failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
             }
         }
     }

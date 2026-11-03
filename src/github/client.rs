@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use reqwest::{Client, Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -15,6 +15,14 @@ pub struct GithubApi {
 
 /// Dispatch runs one event at a time, so a hung request would stall every run.
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A failed GitHub call. Callers match on `status` instead of parsing the message.
+#[derive(Debug, thiserror::Error)]
+#[error("GitHub {status}: {text}")]
+pub struct GithubHttpStatus {
+    pub status: StatusCode,
+    pub text: String,
+}
 
 impl GithubApi {
     pub fn new() -> Self {
@@ -65,17 +73,10 @@ impl GithubApi {
         token: &str,
         body: Option<&Value>,
     ) -> Result<()> {
+        // 204 No Content and other empty bodies decode as `null`.
         let _: Value = self
             .request(method, path, Some(("Bearer", token)), body)
-            .await
-            .or_else(|e| {
-                // 204 No Content has an empty body.
-                if e.to_string().contains("status 204") {
-                    Ok(Value::Null)
-                } else {
-                    Err(e)
-                }
-            })?;
+            .await?;
         Ok(())
     }
 
@@ -102,15 +103,14 @@ impl GithubApi {
         let res = req.send().await.context("GitHub HTTP request failed")?;
         let status = res.status();
         let bytes = res.bytes().await.context("read GitHub response")?;
-        if status == StatusCode::NO_CONTENT {
-            bail!("status 204");
-        }
         if !status.is_success() {
-            let text = String::from_utf8_lossy(&bytes);
-            bail!("GitHub {status}: {text}");
+            return Err(anyhow::Error::new(GithubHttpStatus {
+                status,
+                text: String::from_utf8_lossy(&bytes).into(),
+            }));
         }
         if bytes.is_empty() {
-            // Some endpoints return 200 with an empty body; callers that need JSON use typed T.
+            // 204s and some 200s have an empty body; callers that need JSON use typed T.
             serde_json::from_value(Value::Null).context("empty GitHub body")
         } else {
             serde_json::from_slice(&bytes).context("decode GitHub JSON")

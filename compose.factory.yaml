@@ -1,0 +1,10 @@
+# Adds the agent factory to the control plane. Usage: "Deploy on the control host" in the README.
+# The App key is a bind mount, not an env var: the container runs as uid 65532 (nonroot)
+# and reads /run/secrets/github-app.pem. Put github-app.pem next to this file, then run:
+# chown 65532:65532 github-app.pem && chmod 400 github-app.pem
+services:
+  control-plane:
+    environment:
+      GITHUB_APP_PRIVATE_KEY_FILE: /run/secrets/github-app.pem
+    volumes:
+      - ./github-app.pem:/run/secrets/github-app.pem:ro
