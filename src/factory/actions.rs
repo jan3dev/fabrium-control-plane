@@ -6,6 +6,7 @@ use serde_json::json;
 
 use super::machine::RunState;
 use super::runtime::FactoryRuntime;
+use crate::github::events::{CheckVerdict, combine_check_suites};
 
 pub async fn create_task_room(
     rt: &FactoryRuntime,
@@ -137,6 +138,22 @@ pub async fn comment(rt: &FactoryRuntime, repo: &str, issue: i64, body: &str) ->
         .await
         .with_context(|| format!("comment on {repo}#{issue}"))?;
     Ok(())
+}
+
+/// The combined check-suite verdict for `sha`, or `None` while a suite still runs.
+pub async fn combined_checks(
+    rt: &FactoryRuntime,
+    repo: &str,
+    sha: &str,
+) -> Result<Option<CheckVerdict>> {
+    let token = rt.github_app.token_for_repo(repo).await?;
+    let path = format!("/repos/{repo}/commits/{sha}/check-suites?per_page=100");
+    let body: serde_json::Value = rt
+        .github_api
+        .request_as_install(Method::GET, &path, &token, None)
+        .await
+        .with_context(|| format!("list check suites for {repo}@{sha}"))?;
+    Ok(combine_check_suites(&body))
 }
 
 pub async fn archive_room(rt: &FactoryRuntime, room: &str) -> Result<()> {

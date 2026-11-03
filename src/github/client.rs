@@ -1,5 +1,7 @@
 //! Thin GitHub REST client used by the App and by factory actions.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, Method, StatusCode};
 use serde::de::DeserializeOwned;
@@ -11,18 +13,21 @@ pub struct GithubApi {
     base: String,
 }
 
+/// Dispatch runs one event at a time, so a hung request would stall every run.
+const TIMEOUT: Duration = Duration::from_secs(30);
+
 impl GithubApi {
     pub fn new() -> Self {
-        Self {
-            http: Client::new(),
-            base: "https://api.github.com".into(),
-        }
+        Self::with_base("https://api.github.com")
     }
 
     /// For tests against a stub server.
     pub fn with_base(base: impl Into<String>) -> Self {
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(TIMEOUT)
+                .build()
+                .expect("build GitHub HTTP client"),
             base: base.into(),
         }
     }

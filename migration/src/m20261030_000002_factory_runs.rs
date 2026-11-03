@@ -47,6 +47,11 @@ impl MigrationTrait for Migration {
                             .null(),
                     )
                     .col(
+                        ColumnDef::new(FactoryRuns::CiFailedSha)
+                            .string_len(255)
+                            .null(),
+                    )
+                    .col(
                         ColumnDef::new(FactoryRuns::BudgetEndsAt)
                             .big_integer()
                             .null(),
@@ -95,6 +100,7 @@ enum FactoryRuns {
     CiAttempts,
     ReviewAttempts,
     ReviewHead,
+    CiFailedSha,
     BudgetEndsAt,
     CreatedAt,
     UpdatedAt,

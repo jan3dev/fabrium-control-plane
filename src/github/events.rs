@@ -6,7 +6,7 @@ use serde_json::Value;
 /// An event the factory state machine understands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FactoryEvent {
-    /// An issue gained `factory:ready` (or already had it on open/edit with the headings).
+    /// An issue gained `factory:ready`.
     Ready {
         repo: String,
         issue: i64,
@@ -24,7 +24,9 @@ pub enum FactoryEvent {
         sha: String,
         /// GitHub conclusion: success, failure, cancelled, timed_out, …
         conclusion: String,
-        /// True when every required check (CI + checker) passed.
+        /// True when every check suite on `sha` passed. One webhook sees one suite
+        /// (GitHub Actions makes one per workflow), so the dispatcher replaces this
+        /// and `conclusion` with [`combine_check_suites`] before the transition.
         all_green: bool,
     },
     /// A pull request closed. `merged` distinguishes a merge from a plain close.
@@ -49,7 +51,6 @@ struct Issue {
     number: i64,
     title: String,
     body: Option<String>,
-    labels: Option<Vec<Label>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,7 +118,7 @@ pub fn normalize(event_name: &str, body: &Value) -> Option<FactoryEvent> {
         "check_suite" => normalize_check_suite(body),
         "pull_request" => normalize_pull_request(body),
         // issue_comment and pull_request_review are accepted by the webhook but
-        // do not drive the state machine yet; the reconciler covers drift.
+        // do not drive the state machine yet.
         "issue_comment" | "pull_request_review" | "ping" => None,
         _ => None,
     }
@@ -129,12 +130,11 @@ fn normalize_issues(body: &Value) -> Option<FactoryEvent> {
         .sender
         .as_ref()
         .is_some_and(|s| s.kind.as_deref() == Some("Bot"));
-    let labels = p.issue.labels.as_deref().unwrap_or(&[]);
-    let has_ready = labels.iter().any(|l| l.name == "factory:ready");
+    // Only `labeled`: adding a label needs triage access, editing an issue body does not.
+    // An issue created with the label also sends `labeled`.
     let labeled_ready =
         p.action == "labeled" && p.label.as_ref().is_some_and(|l| l.name == "factory:ready");
-    let opened_or_edited_ready = matches!(p.action.as_str(), "opened" | "edited") && has_ready;
-    if !(labeled_ready || opened_or_edited_ready) {
+    if !labeled_ready {
         return None;
     }
     Some(FactoryEvent::Ready {
@@ -158,13 +158,65 @@ fn normalize_check_suite(body: &Value) -> Option<FactoryEvent> {
         return None;
     }
     let conclusion = p.check_suite.conclusion.unwrap_or_else(|| "neutral".into());
-    let all_green = conclusion == "success";
+    let all_green = is_passing(&conclusion);
     Some(FactoryEvent::CheckSuite {
         repo: p.repository.full_name,
         branch,
         sha,
         conclusion,
         all_green,
+    })
+}
+
+/// GitHub counts a skipped or neutral required check as passing.
+fn is_passing(conclusion: &str) -> bool {
+    matches!(conclusion, "success" | "neutral" | "skipped")
+}
+
+/// The settled result of every check suite on one commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckVerdict {
+    pub all_green: bool,
+    /// `success`, or the conclusion of the first suite that did not pass.
+    pub conclusion: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckSuiteList {
+    check_suites: Vec<ListedSuite>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListedSuite {
+    status: Option<String>,
+    conclusion: Option<String>,
+    latest_check_runs_count: Option<u64>,
+}
+
+/// Fold a `GET /repos/{repo}/commits/{sha}/check-suites` body into one verdict.
+/// Returns `None` while a suite with check runs is still running. Suites without
+/// check runs are skipped: GitHub leaves them queued when no workflow matched.
+pub fn combine_check_suites(body: &Value) -> Option<CheckVerdict> {
+    let list: CheckSuiteList = serde_json::from_value(body.clone()).ok()?;
+    let suites: Vec<_> = list
+        .check_suites
+        .iter()
+        .filter(|s| s.latest_check_runs_count.unwrap_or(0) > 0)
+        .collect();
+    if suites.is_empty()
+        || suites
+            .iter()
+            .any(|s| s.status.as_deref() != Some("completed"))
+    {
+        return None;
+    }
+    let failed = suites
+        .iter()
+        .map(|s| s.conclusion.as_deref().unwrap_or("neutral"))
+        .find(|c| !is_passing(c));
+    Some(CheckVerdict {
+        all_green: failed.is_none(),
+        conclusion: failed.unwrap_or("success").to_owned(),
     })
 }
 
@@ -245,6 +297,22 @@ mod tests {
     }
 
     #[test]
+    fn edit_of_labeled_issue_is_ignored() {
+        let body = json!({
+            "action": "edited",
+            "issue": {
+                "number": 7,
+                "title": "t",
+                "body": "## Goal\n\nx\n\n## Acceptance criteria\n\n- y",
+                "labels": [{"name": "factory:ready"}]
+            },
+            "repository": {"full_name": "acme/sandbox"},
+            "sender": {"type": "User"}
+        });
+        assert!(normalize("issues", &body).is_none());
+    }
+
+    #[test]
     fn other_label_is_ignored() {
         let body = json!({
             "action": "labeled",
@@ -283,6 +351,86 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn skipped_suite_counts_as_passing() {
+        let body = json!({
+            "action": "completed",
+            "check_suite": {
+                "conclusion": "skipped",
+                "head_branch": "factory/3",
+                "head_sha": "abc123",
+                "status": "completed"
+            },
+            "repository": {"full_name": "acme/sandbox"}
+        });
+        assert!(matches!(
+            normalize("check_suite", &body),
+            Some(FactoryEvent::CheckSuite {
+                all_green: true,
+                ..
+            })
+        ));
+    }
+
+    fn suite_list(suites: &[(&str, Option<&str>, u64)]) -> Value {
+        let suites: Vec<Value> = suites
+            .iter()
+            .map(|(status, conclusion, runs)| {
+                json!({
+                    "status": status,
+                    "conclusion": conclusion,
+                    "latest_check_runs_count": runs
+                })
+            })
+            .collect();
+        json!({ "total_count": suites.len(), "check_suites": suites })
+    }
+
+    #[test]
+    fn combined_waits_for_running_suite() {
+        let body = suite_list(&[("completed", Some("success"), 1), ("in_progress", None, 1)]);
+        assert_eq!(combine_check_suites(&body), None);
+    }
+
+    #[test]
+    fn combined_green_needs_every_suite() {
+        let body = suite_list(&[
+            ("completed", Some("success"), 1),
+            ("completed", Some("skipped"), 1),
+            ("queued", None, 0),
+        ]);
+        assert_eq!(
+            combine_check_suites(&body),
+            Some(CheckVerdict {
+                all_green: true,
+                conclusion: "success".into()
+            })
+        );
+    }
+
+    #[test]
+    fn combined_red_names_failing_conclusion() {
+        let body = suite_list(&[
+            ("completed", Some("success"), 1),
+            ("completed", Some("timed_out"), 2),
+        ]);
+        assert_eq!(
+            combine_check_suites(&body),
+            Some(CheckVerdict {
+                all_green: false,
+                conclusion: "timed_out".into()
+            })
+        );
+    }
+
+    #[test]
+    fn combined_without_runs_is_unsettled() {
+        assert_eq!(
+            combine_check_suites(&suite_list(&[("queued", None, 0)])),
+            None
+        );
     }
 
     #[test]
