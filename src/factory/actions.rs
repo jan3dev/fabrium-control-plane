@@ -1,11 +1,12 @@
 //! Apply factory side effects via GitHub and Matrix.
 
 use anyhow::{Context, Result};
-use reqwest::Method;
+use reqwest::{Method, StatusCode};
 use serde_json::json;
 
 use super::machine::RunState;
 use super::runtime::FactoryRuntime;
+use crate::github::client::GithubHttpStatus;
 use crate::github::events::{CheckVerdict, combine_check_suites};
 
 pub async fn create_task_room(
@@ -181,9 +182,15 @@ async fn remove_label(rt: &FactoryRuntime, repo: &str, issue: i64, label: &str) 
         .await
     {
         Ok(()) => Ok(()),
-        Err(e) if e.to_string().contains("404") => Ok(()),
+        // A 404 means the label is already gone.
+        Err(e) if is_github_not_found(&e) => Ok(()),
         Err(e) => Err(e).with_context(|| format!("remove label {label} on {repo}#{issue}")),
     }
+}
+
+fn is_github_not_found(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<GithubHttpStatus>()
+        .is_some_and(|h| h.status == StatusCode::NOT_FOUND)
 }
 
 fn room_alias(repo: &str, issue: i64) -> String {

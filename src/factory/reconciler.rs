@@ -10,6 +10,7 @@ use super::dispatch;
 use super::machine::RunState;
 use super::runtime::FactoryRuntime;
 use crate::entity::factory_runs;
+use crate::entity::github_deliveries;
 use crate::github::events::FactoryEvent;
 
 pub const INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -54,9 +55,58 @@ async fn tick_once(rt: Arc<FactoryRuntime>, db: &DatabaseConnection) -> anyhow::
         }
     }
 
+    prune_deliveries(db, now).await?;
+
     // Listing open factory issues/PRs via the GitHub API fills gaps when a webhook
     // was lost. Keep the first cut to budget expiry so the App stays optional in tests;
     // the poller expands once FACTORY_REPOS installations are live.
     let _ = rt.config.github.factory_repos.len();
     Ok(())
+}
+
+/// GitHub redelivers manually and soon after the original delivery, so older
+/// ids only grow the table. Delete delivery ids older than a week.
+async fn prune_deliveries(db: &DatabaseConnection, now: i64) -> anyhow::Result<u64> {
+    let cutoff = now - 7 * 24 * 60 * 60;
+    let res = github_deliveries::Entity::delete_many()
+        .filter(github_deliveries::Column::ReceivedAt.lt(cutoff))
+        .exec(db)
+        .await?;
+    if res.rows_affected > 0 {
+        tracing::debug!(rows = res.rows_affected, "pruned GitHub delivery ids");
+    }
+    Ok(res.rows_affected)
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::{ActiveModelTrait, Set};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn prune_deletes_only_rows_past_the_window() {
+        let db = crate::db::connect("sqlite::memory:").await.unwrap();
+        let now = 1_000_000_000i64;
+        for (id, received_at) in [("old", now - 8 * 24 * 60 * 60), ("new", now - 24 * 60 * 60)] {
+            github_deliveries::ActiveModel {
+                id: Set(id.to_owned()),
+                received_at: Set(received_at),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(prune_deliveries(&db, now).await.unwrap(), 1);
+
+        let remaining: Vec<String> = github_deliveries::Entity::find()
+            .all(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(remaining, vec!["new".to_owned()]);
+    }
 }

@@ -2,7 +2,7 @@
 
 The control plane receives GitHub App webhooks and runs one **factory run** per issue as a state machine. It wakes zooid agents by posting mentions in Matrix rooms.
 
-This document is the control-plane half of the factory design. Decision records that change Fabrium design rules (agents merge freely; the dispatcher may wake agents) live in the `fabrium` docs repository (`docs/decisions/0002`, `0003`).
+This document is the control-plane half of the factory design.
 
 ## Flow
 
