@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tokio::sync::Mutex;
+
 use crate::{
     config::FactoryConfig,
     github::{GithubApi, GithubApp},
@@ -13,11 +15,18 @@ pub struct FactoryRuntime {
     pub github_app: Arc<GithubApp>,
     pub github_api: Arc<GithubApi>,
     pub matrix: Arc<MatrixClient>,
+    /// Held for one whole dispatch. Two suites on one commit, or `opened` and
+    /// `labeled` on one issue, arrive together and must not both start a step.
+    pub dispatch_lock: Arc<Mutex<()>>,
 }
 
 impl FactoryRuntime {
     pub fn new(config: FactoryConfig) -> anyhow::Result<Self> {
-        let github_api = GithubApi::new();
+        Self::with_github_api(config, GithubApi::new())
+    }
+
+    /// For tests against a stub GitHub API.
+    pub fn with_github_api(config: FactoryConfig, github_api: GithubApi) -> anyhow::Result<Self> {
         let github_app = GithubApp::new(
             config.github.app_id,
             &config.github.private_key_pem,
@@ -34,6 +43,7 @@ impl FactoryRuntime {
             github_app: Arc::new(github_app),
             github_api: Arc::new(github_api),
             matrix: Arc::new(matrix),
+            dispatch_lock: Arc::default(),
         })
     }
 }

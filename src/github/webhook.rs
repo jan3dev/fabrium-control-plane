@@ -71,9 +71,17 @@ pub async fn webhook(
     };
 
     // Answer before the work. GitHub retries on a slow 200; the 10 s layer would also cut us.
+    let delivery = delivery.to_owned();
     tokio::spawn(async move {
         if let Err(e) = dispatch::handle(factory, state.db.clone(), event).await {
-            tracing::error!(error = %format!("{e:#}"), "factory dispatch failed");
+            tracing::error!(error = %format!("{e:#}"), %delivery, "factory dispatch failed");
+            // A redelivery of this id must run again, not come back as a duplicate.
+            if let Err(e) = github_deliveries::Entity::delete_by_id(delivery.clone())
+                .exec(&state.db)
+                .await
+            {
+                tracing::error!(error = %e, %delivery, "release of failed delivery failed");
+            }
         }
     });
 

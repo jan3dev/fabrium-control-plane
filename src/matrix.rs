@@ -5,6 +5,9 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+/// Dispatch runs one event at a time, so a hung request would stall every run.
+const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct MatrixClient {
     http: Client,
@@ -14,9 +17,20 @@ pub struct MatrixClient {
     pub reviewer: String,
 }
 
+/// Body of `createRoom` and of an alias lookup.
 #[derive(Debug, Deserialize)]
 struct CreateRoomResponse {
     room_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MatrixError {
+    errcode: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Whoami {
+    user_id: String,
 }
 
 impl MatrixClient {
@@ -27,7 +41,10 @@ impl MatrixClient {
         reviewer: impl Into<String>,
     ) -> Self {
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(TIMEOUT)
+                .build()
+                .expect("build Matrix HTTP client"),
             homeserver: homeserver.into().trim_end_matches('/').to_owned(),
             access_token: access_token.into(),
             implementer: implementer.into(),
@@ -45,6 +62,7 @@ impl MatrixClient {
     }
 
     /// Create a private room named `#alias_localpart`, invite `user_id`, return the room id.
+    /// If the alias exists (an earlier attempt created the room), return that room.
     pub async fn create_task_room(
         &self,
         alias_localpart: &str,
@@ -58,10 +76,46 @@ impl MatrixClient {
             "invite": [invite],
             "is_direct": false,
         });
-        let res: CreateRoomResponse = self
-            .post("/_matrix/client/v3/createRoom", &body)
+        let (status, bytes) = self
+            .send(
+                reqwest::Method::POST,
+                "/_matrix/client/v3/createRoom",
+                Some(&body),
+            )
             .await
             .context("create Matrix room")?;
+        if status.is_success() {
+            let res: CreateRoomResponse =
+                serde_json::from_slice(&bytes).context("decode Matrix JSON")?;
+            return Ok(res.room_id);
+        }
+        let err: Option<MatrixError> = serde_json::from_slice(&bytes).ok();
+        if err.is_some_and(|e| e.errcode == "M_ROOM_IN_USE") {
+            return self
+                .resolve_alias(alias_localpart)
+                .await
+                .with_context(|| format!("reuse room #{alias_localpart}"));
+        }
+        bail!("Matrix {status}: {}", String::from_utf8_lossy(&bytes))
+    }
+
+    async fn resolve_alias(&self, alias_localpart: &str) -> Result<String> {
+        let me: Whoami = self
+            .request(
+                reqwest::Method::GET,
+                "/_matrix/client/v3/account/whoami",
+                None,
+            )
+            .await?;
+        let (_, server) = me
+            .user_id
+            .split_once(':')
+            .context("bot user id has no server name")?;
+        let path = format!(
+            "/_matrix/client/v3/directory/room/{}",
+            urlencoding_path(&format!("#{alias_localpart}:{server}"))
+        );
+        let res: CreateRoomResponse = self.request(reqwest::Method::GET, &path, None).await?;
         Ok(res.room_id)
     }
 
@@ -143,42 +197,52 @@ impl MatrixClient {
     }
 
     async fn post<T: serde::de::DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
-        self.request(reqwest::Method::POST, path, body).await
+        self.request(reqwest::Method::POST, path, Some(body)).await
     }
 
     async fn put<T: serde::de::DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
-        self.request(reqwest::Method::PUT, path, body).await
+        self.request(reqwest::Method::PUT, path, Some(body)).await
     }
 
     async fn request<T: serde::de::DeserializeOwned>(
         &self,
         method: reqwest::Method,
         path: &str,
-        body: &Value,
+        body: Option<&Value>,
     ) -> Result<T> {
-        let url = format!("{}{path}", self.homeserver);
-        let res = self
-            .http
-            .request(method, &url)
-            .bearer_auth(&self.access_token)
-            .json(body)
-            .send()
-            .await
-            .context("Matrix HTTP request failed")?;
-        let status = res.status();
-        let bytes = res.bytes().await.context("read Matrix response")?;
+        let (status, bytes) = self.send(method, path, body).await?;
         if !status.is_success() {
             let text = String::from_utf8_lossy(&bytes);
             bail!("Matrix {status}: {text}");
         }
         serde_json::from_slice(&bytes).context("decode Matrix JSON")
     }
+
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+        let url = format!("{}{path}", self.homeserver);
+        let mut req = self
+            .http
+            .request(method, &url)
+            .bearer_auth(&self.access_token);
+        if let Some(body) = body {
+            req = req.json(body);
+        }
+        let res = req.send().await.context("Matrix HTTP request failed")?;
+        let status = res.status();
+        let bytes = res.bytes().await.context("read Matrix response")?;
+        Ok((status, bytes.to_vec()))
+    }
 }
 
-fn urlencoding_path(room_id: &str) -> String {
-    // Room ids are `!opaque:server`; encode `!` and `:`.
-    room_id
-        .replace('!', "%21")
+fn urlencoding_path(id: &str) -> String {
+    // Room ids are `!opaque:server` and aliases `#local:server`.
+    id.replace('!', "%21")
+        .replace('#', "%23")
         .replace(':', "%3A")
         .replace('/', "%2F")
 }

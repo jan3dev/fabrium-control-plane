@@ -59,6 +59,8 @@ pub struct RunView {
     pub ci_attempts: i32,
     pub review_attempts: i32,
     pub review_head: Option<String>,
+    /// Last head sha judged red. Two suites that finish together both report it.
+    pub ci_failed_sha: Option<String>,
     pub budget_ends_at: Option<i64>,
 }
 
@@ -150,6 +152,7 @@ pub fn transition(
                         ci_attempts: 0,
                         review_attempts: 0,
                         review_head: None,
+                        ci_failed_sha: None,
                         budget_ends_at: None,
                     },
                     vec![Action::Comment {
@@ -172,11 +175,20 @@ pub fn transition(
                 ci_attempts: 0,
                 review_attempts: 0,
                 review_head: None,
+                ci_failed_sha: None,
                 budget_ends_at: Some(now + 24 * 3600),
             };
+            // Wake first: if it fails, the labels still say `factory:ready`.
             Some((
                 view.clone(),
                 vec![
+                    Action::StartImplementing {
+                        repo: repo.clone(),
+                        issue: *issue,
+                        title: title.clone(),
+                        body: body.clone(),
+                        branch,
+                    },
                     Action::RemoveReadyLabel {
                         repo: repo.clone(),
                         issue: *issue,
@@ -185,13 +197,6 @@ pub fn transition(
                         repo: repo.clone(),
                         issue: *issue,
                         state: RunState::Implementing,
-                    },
-                    Action::StartImplementing {
-                        repo: repo.clone(),
-                        issue: *issue,
-                        title: title.clone(),
-                        body: body.clone(),
-                        branch,
                     },
                 ],
             ))
@@ -211,8 +216,12 @@ pub fn transition(
                 let state = run.state.as_str();
                 return block(run, format!("time budget expired during {state}"));
             }
+            if !*all_green && run.ci_failed_sha.as_deref() == Some(sha.as_str()) {
+                return None;
+            }
             match run.state {
                 RunState::Implementing if !*all_green => {
+                    run.ci_failed_sha = Some(sha.clone());
                     run.ci_attempts += 1;
                     if run.ci_attempts >= CI_ATTEMPT_CAP {
                         return block(
@@ -236,20 +245,21 @@ pub fn transition(
                     Some((
                         run.clone(),
                         vec![
-                            Action::SetStateLabel {
-                                repo: run.repo.clone(),
-                                issue: run.issue,
-                                state: RunState::Review,
-                            },
                             Action::StartReview {
                                 repo: run.repo.clone(),
                                 issue: run.issue,
                                 branch: run.branch.clone(),
                             },
+                            Action::SetStateLabel {
+                                repo: run.repo.clone(),
+                                issue: run.issue,
+                                state: RunState::Review,
+                            },
                         ],
                     ))
                 }
                 RunState::Review if !*all_green => {
+                    run.ci_failed_sha = Some(sha.clone());
                     run.review_attempts += 1;
                     if run.review_attempts >= REVIEW_ATTEMPT_CAP {
                         return block(
@@ -397,11 +407,7 @@ mod tests {
         let (run, actions) = transition(None, &ready(good_body()), 1_000).unwrap();
         assert_eq!(run.state, RunState::Implementing);
         assert_eq!(run.branch, "factory/3");
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::StartImplementing { .. }))
-        );
+        assert!(matches!(actions[0], Action::StartImplementing { .. }));
         assert!(should_persist(&None, &run, &ready(good_body())));
     }
 
@@ -428,16 +434,28 @@ mod tests {
         let (run, _) = transition(None, &ready(good_body()), 1_000).unwrap();
         let mut run = Some(run);
         for i in 1..=2 {
-            let ev = suite("failure", false, "aaa111");
+            let ev = suite("failure", false, &format!("sha{i}"));
             let (next, actions) = transition(run, &ev, 1_000 + i).unwrap();
             assert_eq!(next.ci_attempts, i as i32);
             assert!(matches!(actions[0], Action::RewakeImplementer { .. }));
             run = Some(next);
         }
-        let ev = suite("failure", false, "aaa111");
+        let ev = suite("failure", false, "sha3");
         let (next, actions) = transition(run, &ev, 1_003).unwrap();
         assert_eq!(next.state, RunState::Blocked);
         assert!(actions.iter().any(|a| matches!(a, Action::Comment { .. })));
+    }
+
+    #[test]
+    fn second_red_report_on_one_sha_counts_once() {
+        let (run, _) = transition(None, &ready(good_body()), 1_000).unwrap();
+        let (run, _) = transition(Some(run), &suite("failure", false, "aaa111"), 1_100).unwrap();
+        assert_eq!(run.ci_attempts, 1);
+        assert!(transition(Some(run.clone()), &suite("failure", false, "aaa111"), 1_101).is_none());
+        let (next, actions) =
+            transition(Some(run), &suite("success", true, "aaa111"), 1_200).unwrap();
+        assert_eq!(next.state, RunState::Review);
+        assert!(matches!(actions[0], Action::StartReview { .. }));
     }
 
     #[test]
@@ -447,11 +465,7 @@ mod tests {
         let (next, actions) = transition(Some(run), &ev, 1_100).unwrap();
         assert_eq!(next.state, RunState::Review);
         assert_eq!(next.review_head.as_deref(), Some("abc123"));
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::StartReview { .. }))
-        );
+        assert!(matches!(actions[0], Action::StartReview { .. }));
     }
 
     #[test]
@@ -475,14 +489,14 @@ mod tests {
         run.state = RunState::Review;
         let mut run = Some(run);
         for i in 1..=4 {
-            let ev = suite("failure", false, "bbb222");
+            let ev = suite("failure", false, &format!("sha{i}"));
             let (next, actions) = transition(run, &ev, 1_000 + i).unwrap();
             assert_eq!(next.state, RunState::Review);
             assert_eq!(next.review_attempts, i as i32);
             assert!(matches!(actions[0], Action::RewakeReviewer { .. }));
             run = Some(next);
         }
-        let (next, actions) = transition(run, &suite("failure", false, "bbb222"), 1_005).unwrap();
+        let (next, actions) = transition(run, &suite("failure", false, "sha5"), 1_005).unwrap();
         assert_eq!(next.state, RunState::Blocked);
         assert!(actions.iter().any(|a| matches!(a, Action::Comment { .. })));
     }

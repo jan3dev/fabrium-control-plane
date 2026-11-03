@@ -1,4 +1,8 @@
 //! Load a run, run the pure transition, apply actions, persist.
+//!
+//! A state change is saved only after the wake-up it needs has succeeded. If an
+//! action fails, `handle` returns the error with the old row in place, so the
+//! same event delivered again repeats the step.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,8 +21,27 @@ pub async fn handle(
     db: DatabaseConnection,
     event: FactoryEvent,
 ) -> Result<()> {
+    let _serial = rt.dispatch_lock.lock().await;
     let now = now_secs();
     let before = load_run(&db, &event).await?;
+    let event = match event {
+        FactoryEvent::CheckSuite {
+            repo, branch, sha, ..
+        } if before.is_some() => {
+            let Some(verdict) = actions::combined_checks(&rt, &repo, &sha).await? else {
+                tracing::info!(%repo, %branch, %sha, "check suites still running");
+                return Ok(());
+            };
+            FactoryEvent::CheckSuite {
+                repo,
+                branch,
+                sha,
+                conclusion: verdict.conclusion,
+                all_green: verdict.all_green,
+            }
+        }
+        other => other,
+    };
     let Some((mut after, action_list)) = machine::transition(before.clone(), &event, now) else {
         tracing::debug!(?event, "no factory transition");
         return Ok(());
@@ -36,11 +59,11 @@ pub async fn handle(
                 let room = actions::create_task_room(&rt, &repo, issue, &title)
                     .await
                     .context("StartImplementing create room")?;
-                after.task_room = Some(room.clone());
-                save_run(&db, &after, now).await?;
                 actions::wake_implementer(&rt, &room, issue, &branch, &title, &body)
                     .await
                     .context("StartImplementing wake")?;
+                after.task_room = Some(room);
+                save_run(&db, &after, now).await?;
             }
             Action::RewakeImplementer {
                 conclusion,
@@ -75,11 +98,11 @@ pub async fn handle(
                 let room = actions::create_review_room(&rt, &repo, issue)
                     .await
                     .context("StartReview create room")?;
-                after.review_room = Some(room.clone());
-                save_run(&db, &after, now).await?;
                 actions::wake_reviewer(&rt, &room, &repo, issue, &branch)
                     .await
                     .context("StartReview wake")?;
+                after.review_room = Some(room);
+                save_run(&db, &after, now).await?;
             }
             Action::FinishReview { branch, .. } => {
                 let room = after
@@ -176,6 +199,7 @@ async fn save_run(db: &DatabaseConnection, after: &RunView, now: i64) -> Result<
         am.ci_attempts = Set(after.ci_attempts);
         am.review_attempts = Set(after.review_attempts);
         am.review_head = Set(after.review_head.clone());
+        am.ci_failed_sha = Set(after.ci_failed_sha.clone());
         am.budget_ends_at = Set(after.budget_ends_at);
         am.updated_at = Set(now);
         am.update(db).await.context("update factory_run")?;
@@ -191,6 +215,7 @@ async fn save_run(db: &DatabaseConnection, after: &RunView, now: i64) -> Result<
             ci_attempts: Set(after.ci_attempts),
             review_attempts: Set(after.review_attempts),
             review_head: Set(after.review_head.clone()),
+            ci_failed_sha: Set(after.ci_failed_sha.clone()),
             budget_ends_at: Set(after.budget_ends_at),
             created_at: Set(now),
             updated_at: Set(now),
@@ -213,6 +238,7 @@ fn model_to_view(m: factory_runs::Model) -> RunView {
         ci_attempts: m.ci_attempts,
         review_attempts: m.review_attempts,
         review_head: m.review_head,
+        ci_failed_sha: m.ci_failed_sha,
         budget_ends_at: m.budget_ends_at,
     }
 }

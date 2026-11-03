@@ -15,6 +15,7 @@ pub struct Model {
     pub ci_attempts: i32,
     pub review_attempts: i32,
     pub review_head: Option<String>,
+    pub ci_failed_sha: Option<String>,
     pub budget_ends_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
