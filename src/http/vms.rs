@@ -61,6 +61,7 @@ pub struct Vm {
     public_ip: Option<String>,
     launched_at: String,
     setup: &'static str,
+    auto_stop_hours: Option<u32>,
 }
 
 impl Vm {
@@ -81,6 +82,7 @@ impl Vm {
             public_ip: instance.public_ip.clone(),
             launched_at: (instance.launched_at.fmt(DateTimeFormat::DateTime)).unwrap_or_default(),
             setup,
+            auto_stop_hours: instance.auto_stop_hours,
         }
     }
 }
@@ -127,12 +129,13 @@ async fn find(state: &AppState, tenant: &str, id: &str) -> Result<Instance, AppE
         .ok_or(AppError::NotFound)
 }
 
-/// `POST` route that applies `action` to the VM of the path. 
+/// `POST` route that applies `action` to the VM of the path.
 pub fn action(action: Action) -> MethodRouter<AppState> {
     post(
         move |state: State<AppState>,
               client: Extension<Client>,
-              id: Result<Path<String>, PathRejection>| apply(action, state, client, id),
+              id: Result<Path<String>, PathRejection>,
+              body: Bytes| apply(action, state, client, id, body),
     )
 }
 
@@ -141,17 +144,51 @@ async fn apply(
     State(state): State<AppState>,
     Extension(client): Extension<Client>,
     id: Result<Path<String>, PathRejection>,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<Vm>), AppError> {
     let id = id_of(id)?;
+    // Only `start` reads a body: `{"auto_stop_hours": N}`. An empty body leaves the tag alone.
+    let hours = if action == Action::Start && !body.is_empty() {
+        let request: StartVm = serde_json::from_slice(&body)
+            .map_err(|_| AppError::BadRequest("invalid request body".to_owned()))?;
+        valid_hours(request.auto_stop_hours)?
+    } else {
+        None
+    };
     let mut vm = find(&state, &client.name, &id).await?;
     if action.allowed_from().is_some_and(|from| from != vm.state) {
         return Err(AppError::Conflict(format!("vm is {}", vm.state)));
+    }
+    if let Some(hours) = hours {
+        // A failed tag call must not start the VM: it would run with the old limit.
+        state.ec2.set_auto_stop_hours(&vm.id, hours).await?;
+        vm.auto_stop_hours = Some(hours);
     }
     state.ec2.act(&vm.id, action).await?;
     tracing::info!(tenant = %client.name, vm = %vm.id, ?action, "vm action");
     // EC2 still reports the old state for a moment, so show the state that the action causes.
     vm.state = action.next_state().to_owned();
     Ok((StatusCode::ACCEPTED, Json(Vm::new(&vm, &state.bootstrap))))
+}
+
+#[derive(Deserialize)]
+struct StartVm {
+    auto_stop_hours: Option<i64>,
+}
+
+/// The default of `auto_stop_hours` at create.
+const DEFAULT_AUTO_STOP_HOURS: u32 = 12;
+
+/// `auto_stop_hours` must be 1 to 168. `None` stays `None`.
+fn valid_hours(hours: Option<i64>) -> Result<Option<u32>, AppError> {
+    hours
+        .map(|h| {
+            u32::try_from(h)
+                .ok()
+                .filter(|h| (1..=168).contains(h))
+                .ok_or_else(|| AppError::BadRequest("auto_stop_hours must be 1 to 168".to_owned()))
+        })
+        .transpose()
 }
 
 pub async fn delete(
@@ -173,6 +210,7 @@ struct CreateVm {
     name: String,
     instance_type: Option<String>,
     bootstrap: Payload,
+    auto_stop_hours: Option<i64>,
 }
 
 /// `^[a-z0-9][a-z0-9-]{0,62}$`
@@ -207,6 +245,7 @@ pub async fn create(
         .bootstrap
         .validate()
         .map_err(|e| AppError::BadRequest(e.to_owned()))?;
+    let auto_stop_hours = valid_hours(request.auto_stop_hours)?.unwrap_or(DEFAULT_AUTO_STOP_HOURS);
 
     // ponytail: one create at a time (README, "Create a VM"); a lock per tenant and name scales.
     let guard = state.create_lock.clone().lock_owned().await;
@@ -216,7 +255,7 @@ pub async fn create(
     let task = tokio::spawn(
         async move {
             let _guard = guard;
-            launch_vm(&state, &tenant, request, &instance_type).await
+            launch_vm(&state, &tenant, request, &instance_type, auto_stop_hours).await
         }
         .in_current_span(),
     );
@@ -233,6 +272,7 @@ async fn launch_vm(
     tenant: &str,
     request: CreateVm,
     instance_type: &str,
+    auto_stop_hours: u32,
 ) -> Result<Vm, AppError> {
     // EC2 lists a new VM late, so a name that the payload store holds counts as in use too.
     let listed = (state.ec2.list(tenant).await?)
@@ -247,6 +287,7 @@ async fn launch_vm(
         name: request.name,
         tenant: tenant.to_owned(),
         instance_type: instance_type.to_owned(),
+        auto_stop_hours,
         user_data: STANDARD.encode(bootstrap::stub(&state.vm.public_url, &token)),
     };
     let instance = state.ec2.launch(&launch).await?;
