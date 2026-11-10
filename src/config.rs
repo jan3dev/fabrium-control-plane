@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr};
+use std::{env, fs, net::SocketAddr, path::Path};
 
 use anyhow::{Context, Result, ensure};
 
@@ -12,6 +12,106 @@ pub struct Config {
     pub database_url: String,
     pub api_keys: ApiKeys,
     pub vm: VmConfig,
+    /// Present when every factory env var is set. Otherwise the webhook answers 404.
+    pub factory: Option<FactoryConfig>,
+}
+
+/// GitHub App + Matrix bot settings for the agent factory.
+#[derive(Clone, Debug)]
+pub struct FactoryConfig {
+    pub github: GithubConfig,
+    pub matrix: MatrixConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct GithubConfig {
+    pub app_id: u64,
+    pub private_key_pem: String,
+    pub webhook_secret: String,
+    /// Allowlist of `owner/name` repositories.
+    pub factory_repos: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MatrixConfig {
+    pub homeserver: String,
+    pub access_token: String,
+    pub implementer: String,
+    pub reviewer: String,
+}
+
+impl FactoryConfig {
+    pub fn allows_repo(&self, full_name: &str) -> bool {
+        self.github
+            .factory_repos
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(full_name))
+    }
+
+    /// All factory variables together, or none. A partial set is an error.
+    fn from_lookup(get: &impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
+        let set = |name: &str| get(name).filter(|v| !v.is_empty());
+        let has_pem = set("GITHUB_APP_PRIVATE_KEY").is_some();
+        let has_file = set("GITHUB_APP_PRIVATE_KEY_FILE").is_some();
+        let flags = [
+            set("GITHUB_APP_ID").is_some(),
+            has_pem || has_file,
+            set("GITHUB_WEBHOOK_SECRET").is_some(),
+            set("FACTORY_REPOS").is_some(),
+            set("MATRIX_HOMESERVER").is_some(),
+            set("MATRIX_ACCESS_TOKEN").is_some(),
+            set("MATRIX_IMPLEMENTER").is_some(),
+            set("MATRIX_REVIEWER").is_some(),
+        ];
+        let any = flags.iter().any(|f| *f);
+        let all = flags.iter().all(|f| *f);
+        if !any {
+            return Ok(None);
+        }
+        ensure!(
+            all,
+            "factory config is incomplete: set GITHUB_APP_ID, \
+             GITHUB_APP_PRIVATE_KEY_FILE (or GITHUB_APP_PRIVATE_KEY), \
+             GITHUB_WEBHOOK_SECRET, FACTORY_REPOS, MATRIX_HOMESERVER, \
+             MATRIX_ACCESS_TOKEN, MATRIX_IMPLEMENTER, MATRIX_REVIEWER"
+        );
+
+        let app_id: u64 = set("GITHUB_APP_ID")
+            .context("GITHUB_APP_ID is not set")?
+            .parse()
+            .context("GITHUB_APP_ID must be a number")?;
+        let private_key_pem = if let Some(pem) = set("GITHUB_APP_PRIVATE_KEY") {
+            pem.replace("\\n", "\n")
+        } else {
+            let path = set("GITHUB_APP_PRIVATE_KEY_FILE")
+                .context("GITHUB_APP_PRIVATE_KEY_FILE is not set")?;
+            fs::read_to_string(Path::new(&path))
+                .with_context(|| format!("read GITHUB_APP_PRIVATE_KEY_FILE {path}"))?
+        };
+        let homeserver = set("MATRIX_HOMESERVER").context("MATRIX_HOMESERVER is not set")?;
+        ensure!(
+            homeserver.starts_with("https://") || homeserver.starts_with("http://"),
+            "MATRIX_HOMESERVER must be an http(s) URL"
+        );
+        Ok(Some(Self {
+            github: GithubConfig {
+                app_id,
+                private_key_pem,
+                webhook_secret: set("GITHUB_WEBHOOK_SECRET")
+                    .context("GITHUB_WEBHOOK_SECRET is not set")?,
+                factory_repos: parse_factory_repos(
+                    &set("FACTORY_REPOS").context("FACTORY_REPOS is not set")?,
+                )?,
+            },
+            matrix: MatrixConfig {
+                homeserver: homeserver.trim_end_matches('/').to_owned(),
+                access_token: set("MATRIX_ACCESS_TOKEN")
+                    .context("MATRIX_ACCESS_TOKEN is not set")?,
+                implementer: set("MATRIX_IMPLEMENTER").context("MATRIX_IMPLEMENTER is not set")?,
+                reviewer: set("MATRIX_REVIEWER").context("MATRIX_REVIEWER is not set")?,
+            },
+        }))
+    }
 }
 
 /// Where and how the service launches VMs.
@@ -48,8 +148,27 @@ impl Config {
             database_url: env_or(&get, "DATABASE_URL", "sqlite://data/control-plane.db"),
             api_keys: ApiKeys::parse(&api_keys).context("invalid API_KEYS")?,
             vm: VmConfig::from_lookup(&get)?,
+            factory: FactoryConfig::from_lookup(&get)?,
         })
     }
+}
+
+fn parse_factory_repos(raw: &str) -> Result<Vec<String>> {
+    let list: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    ensure!(!list.is_empty(), "FACTORY_REPOS is empty");
+    for repo in &list {
+        ensure!(
+            repo.split_once('/')
+                .is_some_and(|(o, n)| !o.is_empty() && !n.is_empty() && !n.contains('/')),
+            "FACTORY_REPOS entry {repo:?} must look like owner/name"
+        );
+    }
+    Ok(list)
 }
 
 impl VmConfig {
@@ -315,5 +434,37 @@ mod tests {
         assert!(load(&vars).is_err());
         // A custom list that leaves out the default default.
         assert!(load(&[("INSTANCE_TYPES", "t3.large")]).is_err());
+    }
+
+    #[test]
+    fn factory_defaults_to_none() {
+        assert!(load(&[]).unwrap().factory.is_none());
+    }
+
+    #[test]
+    fn partial_factory_config_fails() {
+        assert!(load(&[("GITHUB_APP_ID", "1")]).is_err());
+    }
+
+    #[test]
+    fn complete_factory_config_loads() {
+        let pem = include_str!("../tests/fixtures/factory-test-key.pem");
+        let c = load(&[
+            ("GITHUB_APP_ID", "42"),
+            ("GITHUB_APP_PRIVATE_KEY", pem),
+            ("GITHUB_WEBHOOK_SECRET", "sec"),
+            ("FACTORY_REPOS", "acme/sandbox, acme/other"),
+            ("MATRIX_HOMESERVER", "https://matrix.example.org/"),
+            ("MATRIX_ACCESS_TOKEN", "tok"),
+            ("MATRIX_IMPLEMENTER", "@impl:example.org"),
+            ("MATRIX_REVIEWER", "@rev:example.org"),
+        ])
+        .unwrap();
+        let f = c.factory.unwrap();
+        assert_eq!(f.github.app_id, 42);
+        assert_eq!(f.github.factory_repos, ["acme/sandbox", "acme/other"]);
+        assert!(f.allows_repo("acme/sandbox"));
+        assert!(!f.allows_repo("acme/nope"));
+        assert_eq!(f.matrix.homeserver, "https://matrix.example.org");
     }
 }
