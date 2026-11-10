@@ -59,7 +59,7 @@ The database lives in the `data` Docker volume. It survives restarts.
 | `PUBLIC_URL` | none (required) | from `.env` | The base URL that VMs use to redeem their token. It must start with `https://` and must not hold a quote or a space. The service removes a trailing `/`. |
 | `AWS_REGION` | `us-east-2` | from `.env` | AWS has SEV-SNP on shared tenancy only in `us-east-2` and `eu-west-1`. In another region, the service refuses to start if `INSTANCE_TYPES` has a SEV-SNP type. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | none | from `.env` | The AWS SDK reads them from the environment. Temporary credentials expire. Put new ones in `.env` and recreate the container. |
-| `AMI_NAME` | `ubuntu-24.04-jan3-dev-env-v3` | from `.env` | The VM image. The service uses the newest available image that the account owns with this name and with the tag `Project=jan3-dev-env`. |
+| `AMI_NAME` | `ubuntu-24.04-jan3-dev-env-v4` | from `.env` | The VM image. The service uses the newest available image that the account owns with this name and with the tag `Project=jan3-dev-env`. |
 | `INSTANCE_TYPES` | `t3a.medium,t3a.large,t3.medium,t3.large,m6a.large,c6a.large,r6a.large` | from `.env` | The allowlist, in the order that the API shows it. Each entry is `<family>.<size>`. The family is `t3`, `t3a`, `c6a`, `m6a`, or `r6a`. The service refuses to start with another family or with a duplicate. |
 | `DEFAULT_INSTANCE_TYPE` | `t3a.medium` | from `.env` | Must be in `INSTANCE_TYPES`. |
 | `SECURITY_GROUP` | `jan3-dev-env-ssh` | from `.env` | The security group of new VMs, by name. |
@@ -128,7 +128,8 @@ A VM:
   "sev_snp": false,
   "public_ip": "203.0.113.10",
   "launched_at": "2026-10-26T19:00:00Z",
-  "setup": "delivered"
+  "setup": "delivered",
+  "auto_stop_hours": 12
 }
 ```
 
@@ -137,6 +138,8 @@ A VM:
 - `launched_at` is the EC2 launch time in UTC, in whole seconds. EC2 resets it at each start.
 - `sev_snp` is `true` for the sizes that AWS launches with AMD SEV-SNP: `c6a.large` to `c6a.16xlarge`, `m6a.large` to `m6a.8xlarge`, and `r6a.large` to `r6a.4xlarge`. The service enables SEV-SNP for exactly those. A larger size of these families launches without it.
 - `setup` is `delivered` if the VM has the tag of a redeemed token, `pending` while its token is live (not redeemed yet, or in the 60 s after the first redeem, before the tag shows), and `expired` if not. An `expired` VM never got its payload. Delete it and create it again.
+
+- `auto_stop_hours` is the value of the tag `fabrium:auto-stop-hours`, an integer. It is `null` if the tag is missing or not an integer. The VM powers itself off when its uptime reaches this many hours. EC2 then shows it as `stopped`.
 
 An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and are cached after the first success.
 
@@ -150,6 +153,7 @@ An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and 
 {
   "name": "lima",
   "instance_type": "t3a.medium",
+  "auto_stop_hours": 12,
   "bootstrap": {
     "files": [
       { "path": "/home/ubuntu/zooid/.env", "mode": "600", "owner": "ubuntu", "content": "..." }
@@ -163,6 +167,7 @@ An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and 
 |-------|-------------------|
 | `name` | `^[a-z0-9][a-z0-9-]{0,62}$` |
 | `instance_type` | Optional. In `INSTANCE_TYPES`. The default is `DEFAULT_INSTANCE_TYPE`. |
+| `auto_stop_hours` | Optional integer from 1 to 168. The default is 12. |
 | `files[].path` | Starts with `/` and does not end with `/`. No `..` segment. No control character, such as a newline or a NUL byte. |
 | `files[].mode` | `^[0-7]{3,4}$` |
 | `files[].owner` | `^[a-z_][a-z0-9_-]{0,31}$` |
@@ -187,6 +192,16 @@ Another state gives `409 {"error":"vm is <state>"}`. EC2 still reports the old s
 An `{id}` that does not match `^i-[0-9a-f]{8,17}$`, a VM of another tenant, a VM without the `fabrium:tenant` tag, and a terminated VM all give `404 {"error":"not found"}`. A response never shows that a VM of another tenant exists. The code checks the tag of every VM that EC2 returns. IAM backs this up.
 
 A failed AWS call gives `502 {"error":"aws request failed"}`. The AWS detail goes to the log.
+
+### Auto-stop
+
+Every VM carries the tag `fabrium:auto-stop-hours`, a decimal integer from 1 to 168. A watcher in the VM image reads it every 5 minutes through the instance metadata service (IMDS) and powers the VM off when the uptime reaches that many hours. The shutdown behavior stays `stop`, so the VM ends as `stopped`.
+
+- A create sets the tag from `auto_stop_hours` (default 12). It also turns on instance tags in IMDS (`InstanceMetadataTags=enabled`), which the watcher needs.
+- `POST /v1/vms/{id}/start` takes an optional body `{"auto_stop_hours": N}`. With a value, the service validates it (`400` if not 1 to 168), checks that the VM is `stopped` (`409` if not), sets the tag, and then starts the VM. If the tag call fails, the result is `502` and the VM does not start. With no body, or a body without the field, the tag stays as it is.
+- Stop, reboot, and delete do not read a body.
+
+Upgrade note: apply the IAM policy change (the new key in the `MarkSetupDelivered` statement) before you deploy this version. If not, a start that carries `auto_stop_hours` fails at `CreateTags`. The default image is now `ubuntu-24.04-jan3-dev-env-v4`, which has the watcher.
 
 ### Bootstrap
 
@@ -275,7 +290,7 @@ The compiler alone peaks at 8.3 GiB, so a machine with 8 GiB of RAM is not enoug
 
 - `Describe*` on every resource, because EC2 has no resource-level permissions for describe actions.
 - `RunInstances` only with the request tag `fabrium:tenant`, IMDSv2 required, and an instance type of an allowed family. It accepts only images that the account owns with the tag `Project=jan3-dev-env`, one security group, and one key pair.
-- `CreateTags` only during a launch, plus the single key `fabrium:setup` on instances that have `fabrium:tenant`.
+- `CreateTags` only during a launch, plus the keys `fabrium:setup` and `fabrium:auto-stop-hours` on instances that have `fabrium:tenant`.
 - Start, stop, reboot, and terminate only on instances that have `fabrium:tenant`.
 - No `iam:PassRole`, because VMs get no instance profile.
 

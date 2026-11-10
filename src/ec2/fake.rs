@@ -34,6 +34,7 @@ pub fn instance(
         public_ip: None,
         launched_at: DateTime::from_secs(LAUNCHED_AT_SECS),
         setup_delivered: false,
+        auto_stop_hours: None,
     }
 }
 
@@ -51,6 +52,8 @@ struct Inner {
     fail: bool,
     fail_writes: bool,
     fail_tagging: bool,
+    fail_auto_stop: bool,
+    auto_stop_sets: Vec<(String, u32, usize)>,
     hang_tagging: bool,
     launch_delay: Duration,
     hide_launches: bool,
@@ -106,6 +109,16 @@ impl FakeEc2 {
     /// While on, `mark_setup_delivered` returns an error.
     pub fn fail_tagging(&self, on: bool) {
         self.inner().fail_tagging = on;
+    }
+
+    /// While on, `set_auto_stop_hours` returns an error.
+    pub fn fail_auto_stop(&self, on: bool) {
+        self.inner().fail_auto_stop = on;
+    }
+
+    /// Each `set_auto_stop_hours` call as (id, hours, number of actions done before it).
+    pub fn auto_stop_sets(&self) -> Vec<(String, u32, usize)> {
+        self.inner().auto_stop_sets.clone()
     }
 
     /// While on, `mark_setup_delivered` never finishes.
@@ -169,13 +182,16 @@ impl Ec2 for FakeEc2 {
             ensure!(!inner.fail_writes, "fake EC2 write failure");
             // 17 hex digits, like EC2. The `fa` prefix keeps these apart from seeded ids.
             let id = format!("i-fa{:015x}", inner.launches.len() + 1);
-            let launched = instance(
-                &id,
-                &launch.name,
-                Some(&launch.tenant),
-                "pending",
-                &launch.instance_type,
-            );
+            let launched = Instance {
+                auto_stop_hours: Some(launch.auto_stop_hours),
+                ..instance(
+                    &id,
+                    &launch.name,
+                    Some(&launch.tenant),
+                    "pending",
+                    &launch.instance_type,
+                )
+            };
             inner.instances.push(launched.clone());
             inner.launched_ids.push(id);
             inner.launches.push(launch.clone());
@@ -211,6 +227,18 @@ impl Ec2 for FakeEc2 {
         found.setup_delivered = true;
         Ok(())
     }
+
+    async fn set_auto_stop_hours(&self, id: &str, hours: u32) -> Result<()> {
+        self.check()?;
+        let mut inner = self.inner();
+        ensure!(!inner.fail_auto_stop, "fake EC2 tagging failure");
+        let done = inner.actions.len();
+        let found = (inner.instances.iter_mut().find(|i| i.id == id))
+            .with_context(|| format!("no instance {id}"))?;
+        found.auto_stop_hours = Some(hours);
+        inner.auto_stop_sets.push((id.to_owned(), hours, done));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +251,7 @@ mod tests {
             tenant: "stage".to_owned(),
             instance_type: "t3a.medium".to_owned(),
             user_data: "dXNlcg==".to_owned(),
+            auto_stop_hours: 12,
         }
     }
 

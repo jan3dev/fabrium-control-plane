@@ -80,6 +80,7 @@ async fn list_shows_only_live_vms_of_the_caller_sorted_by_name() {
     h.fake.seed(Instance {
         public_ip: Some("203.0.113.10".to_owned()),
         setup_delivered: true,
+        auto_stop_hours: Some(8),
         ..stage_vm("i-0000000000000002", "b", "running", "t3a.medium")
     });
     h.fake
@@ -114,12 +115,14 @@ async fn list_shows_only_live_vms_of_the_caller_sorted_by_name() {
             {
                 "id": "i-0000000000000001", "name": "a", "state": "stopped",
                 "instance_type": "m6a.large", "sev_snp": true, "public_ip": null,
-                "launched_at": "2026-10-26T19:00:00Z", "setup": "expired"
+                "launched_at": "2026-10-26T19:00:00Z", "setup": "expired",
+                "auto_stop_hours": null
             },
             {
                 "id": "i-0000000000000002", "name": "b", "state": "running",
                 "instance_type": "t3a.medium", "sev_snp": false, "public_ip": "203.0.113.10",
-                "launched_at": "2026-10-26T19:00:00Z", "setup": "delivered"
+                "launched_at": "2026-10-26T19:00:00Z", "setup": "delivered",
+                "auto_stop_hours": 8
             }
         ])
     );
@@ -933,4 +936,133 @@ async fn delete_before_redeem_drops_the_token() {
     );
     let (status, body) = redeem(&h, &token).await;
     assert_eq!((status, body), (StatusCode::NOT_FOUND, not_found()));
+}
+
+#[tokio::test]
+async fn create_sets_the_auto_stop_hours_to_12_by_default() {
+    let h = harness().await;
+    let (status, vm) = create(&h.app, STAGE, &create_body("lima")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(h.fake.launches()[0].auto_stop_hours, 12);
+    assert_eq!(vm["auto_stop_hours"], 12);
+}
+
+#[tokio::test]
+async fn create_uses_the_requested_auto_stop_hours() {
+    for hours in [1, 24, 168] {
+        let h = harness().await;
+        let body = with(|b| b["auto_stop_hours"] = json!(hours));
+        let (status, vm) = create(&h.app, STAGE, &body).await;
+        assert_eq!(status, StatusCode::CREATED, "{hours}");
+        assert_eq!(h.fake.launches()[0].auto_stop_hours, hours, "{hours}");
+        assert_eq!(vm["auto_stop_hours"], hours, "{hours}");
+    }
+}
+
+#[tokio::test]
+async fn create_rejects_invalid_auto_stop_hours_with_400() {
+    let h = harness().await;
+    let bad = [json!(0), json!(169), json!(-1), json!(1.5), json!("12")];
+    for hours in bad {
+        let body = with(|b| b["auto_stop_hours"] = hours.clone());
+        let (status, _) = create(&h.app, STAGE, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{hours}");
+    }
+    assert!(h.fake.launches().is_empty());
+}
+
+async fn start(h: &Harness, id: &str, body: &str) -> (StatusCode, Value) {
+    let uri = format!("/v1/vms/{id}/start");
+    let (status, bytes) = send(&h.app, "POST", &uri, Some(STAGE), body.as_bytes().to_vec()).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn stopped(h: &Harness) {
+    h.fake.seed(stage_vm(ID, "lima", "stopped", "t3a.medium"));
+}
+
+#[tokio::test]
+async fn start_without_a_body_leaves_the_tag_alone() {
+    let h = harness().await;
+    stopped(&h);
+    let (status, _) = start(&h, ID, "").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(h.fake.auto_stop_sets().is_empty());
+    assert_eq!(h.fake.actions(), [(ID.to_owned(), Action::Start)]);
+    // An empty object carries no hours either.
+    let h = harness().await;
+    stopped(&h);
+    assert_eq!(start(&h, ID, "{}").await.0, StatusCode::ACCEPTED);
+    assert!(h.fake.auto_stop_sets().is_empty());
+}
+
+#[tokio::test]
+async fn start_with_hours_sets_the_tag_before_it_starts() {
+    let h = harness().await;
+    stopped(&h);
+    let (status, vm) = start(&h, ID, r#"{"auto_stop_hours": 6}"#).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(vm["auto_stop_hours"], 6);
+    // The tag call came before the first action.
+    assert_eq!(h.fake.auto_stop_sets(), [(ID.to_owned(), 6, 0)]);
+    assert_eq!(h.fake.actions(), [(ID.to_owned(), Action::Start)]);
+}
+
+#[tokio::test]
+async fn start_with_invalid_hours_is_400_and_does_nothing() {
+    let h = harness().await;
+    stopped(&h);
+    for body in [
+        r#"{"auto_stop_hours": 0}"#,
+        r#"{"auto_stop_hours": 169}"#,
+        r#"{"auto_stop_hours": 2.5}"#,
+        r#"{"auto_stop_hours": "6"}"#,
+        "not json",
+    ] {
+        assert_eq!(
+            start(&h, ID, body).await.0,
+            StatusCode::BAD_REQUEST,
+            "{body}"
+        );
+    }
+    assert!(h.fake.auto_stop_sets().is_empty());
+    assert!(h.fake.actions().is_empty());
+}
+
+#[tokio::test]
+async fn start_with_hours_on_a_running_vm_is_409_without_a_tag() {
+    let h = harness().await;
+    h.fake.seed(stage_vm(ID, "lima", "running", "t3a.medium"));
+    let (status, body) = start(&h, ID, r#"{"auto_stop_hours": 6}"#).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body, json!({ "error": "vm is running" }));
+    assert!(h.fake.auto_stop_sets().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_tag_call_stops_the_start() {
+    let h = harness().await;
+    stopped(&h);
+    h.fake.fail_auto_stop(true);
+    let (status, body) = start(&h, ID, r#"{"auto_stop_hours": 6}"#).await;
+    assert_eq!((status, body), (StatusCode::BAD_GATEWAY, aws_failed()));
+    assert!(h.fake.actions().is_empty());
+    assert_eq!(h.fake.instance(ID).unwrap().state, "stopped");
+}
+
+#[tokio::test]
+async fn list_shows_auto_stop_hours_or_null() {
+    let h = harness().await;
+    h.fake.seed(Instance {
+        auto_stop_hours: Some(8),
+        ..stage_vm("i-0000000000000001", "a", "running", "t3a.medium")
+    });
+    h.fake
+        .seed(stage_vm("i-0000000000000002", "b", "running", "t3a.medium"));
+    let (_, listed) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
+    assert_eq!(listed[0]["auto_stop_hours"], 8);
+    assert_eq!(listed[1]["auto_stop_hours"], Value::Null);
 }
