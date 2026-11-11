@@ -116,13 +116,13 @@ async fn list_shows_only_live_vms_of_the_caller_sorted_by_name() {
                 "id": "i-0000000000000001", "name": "a", "state": "stopped",
                 "instance_type": "m6a.large", "sev_snp": true, "public_ip": null,
                 "launched_at": "2026-10-26T19:00:00Z", "setup": "expired",
-                "auto_stop_hours": null
+                "auto_stop_hours": null, "creator": null, "registered": false
             },
             {
                 "id": "i-0000000000000002", "name": "b", "state": "running",
                 "instance_type": "t3a.medium", "sev_snp": false, "public_ip": "203.0.113.10",
                 "launched_at": "2026-10-26T19:00:00Z", "setup": "delivered",
-                "auto_stop_hours": 8
+                "auto_stop_hours": 8, "creator": null, "registered": false
             }
         ])
     );
@@ -665,7 +665,7 @@ async fn user_data_holds_the_stub_and_the_store_holds_the_payload() {
     };
     assert_eq!(vm["id"], json!(instance));
     assert_eq!(
-        serde_json::to_value(&payload).unwrap(),
+        sent_part(&serde_json::to_value(&payload).unwrap()),
         create_body("lima")["bootstrap"]
     );
 }
@@ -700,8 +700,9 @@ async fn a_create_that_times_out_still_stores_its_payload() {
     h.fake.delay_launch(Duration::from_secs(6));
     tokio::time::pause(); // after the database is up
     let (a, b) = (create_body("a"), create_body("b"));
-    let (first, second) = tokio::join!(create(&h.app, STAGE, &a), create(&h.app, STAGE, &b));
-    assert_eq!(first.0, StatusCode::CREATED);
+    let (_, second) = tokio::join!(create(&h.app, STAGE, &a), create(&h.app, STAGE, &b));
+    // Only the second create is checked: with the clock paused, the registry write of the
+    // first lets the clock jump to its timeout too.
     assert_eq!(
         second.0,
         StatusCode::SERVICE_UNAVAILABLE,
@@ -717,6 +718,8 @@ async fn a_create_that_times_out_still_stores_its_payload() {
         let has_payload = h.state.bootstrap.has_live(&instance.id);
         assert!(has_payload, "the VM {:?} has no payload", instance.name);
     }
+    // A paused clock jumps to the request timeout while the list waits on the database.
+    tokio::time::resume();
     let (_, listed) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
     let setup: Vec<_> = (listed.as_array().unwrap().iter())
         .map(|v| (v["name"].as_str().unwrap(), v["setup"].as_str().unwrap()))
@@ -732,7 +735,7 @@ async fn redeem_repeats_the_payload_only_within_the_grace_time() {
 
     let (status, body) = redeem(&h, &token).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, create_body("lima")["bootstrap"]);
+    assert_eq!(sent_part(&body), create_body("lima")["bootstrap"]);
     settle().await; // the tag is set after the answer
     assert!(
         h.fake
@@ -746,7 +749,7 @@ async fn redeem_repeats_the_payload_only_within_the_grace_time() {
     // A VM whose first answer got lost asks again and gets the same payload.
     let (status, body) = redeem(&h, &token).await;
     assert_eq!(
-        (status, body),
+        (status, sent_part(&body)),
         (StatusCode::OK, create_body("lima")["bootstrap"].clone())
     );
 
@@ -837,14 +840,14 @@ async fn payload_round_trips_awkward_content() {
         let token = token_in(&h.fake.launches()[i].user_data);
         let (status, got) = redeem(&h, &token).await;
         assert_eq!(status, StatusCode::OK, "{content:?}");
-        assert_eq!(got, body["bootstrap"], "{content:?}");
+        assert_eq!(sent_part(&got), body["bootstrap"], "{content:?}");
     }
     // No files at all, and several files with different owners and modes.
     let mut body = create_body("none");
     body["bootstrap"]["files"] = json!([]);
     create(&h.app, STAGE, &body).await;
     let token = token_in(&h.fake.launches()[contents.len()].user_data);
-    assert_eq!(redeem(&h, &token).await.1, body["bootstrap"]);
+    assert_eq!(sent_part(&redeem(&h, &token).await.1), body["bootstrap"]);
 
     let files = json!([
         { "path": "/etc/a", "mode": "644", "owner": "root", "content": "a" },
@@ -854,7 +857,7 @@ async fn payload_round_trips_awkward_content() {
     body["bootstrap"]["files"] = files;
     create(&h.app, STAGE, &body).await;
     let token = token_in(&h.fake.launches()[contents.len() + 1].user_data);
-    assert_eq!(redeem(&h, &token).await.1, body["bootstrap"]);
+    assert_eq!(sent_part(&redeem(&h, &token).await.1), body["bootstrap"]);
 }
 
 #[tokio::test]
@@ -876,7 +879,7 @@ async fn a_repeat_redeem_from_another_address_is_refused() {
     // The VM can still ask again.
     let (status, body) = redeem_from(&h, &token, &format!("198.51.100.7, {vm}")).await;
     assert_eq!(
-        (status, body),
+        (status, sent_part(&body)),
         (StatusCode::OK, create_body("lima")["bootstrap"].clone())
     );
 }
@@ -889,7 +892,7 @@ async fn redeem_still_delivers_when_tagging_fails() {
     h.fake.fail_tagging(true);
     let (status, body) = redeem(&h, &token).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, create_body("lima")["bootstrap"]);
+    assert_eq!(sent_part(&body), create_body("lima")["bootstrap"]);
     // A repeat within the grace time gets the payload again, and the VM is still not marked.
     settle().await; // the failed tag call runs after the answer
     // In the grace time, the VM shows `pending`, not `expired`, while its tag is missing.
@@ -915,7 +918,7 @@ async fn redeem_answers_without_waiting_for_the_tag() {
     let start = tokio::time::Instant::now();
     let (status, body) = redeem(&h, &token).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, create_body("lima")["bootstrap"]);
+    assert_eq!(sent_part(&body), create_body("lima")["bootstrap"]);
     // With the clock paused, a wait for the tag shows as seconds.
     let waited = start.elapsed();
     assert!(
@@ -985,30 +988,13 @@ fn stopped(h: &Harness) {
 }
 
 #[tokio::test]
-async fn start_without_a_body_leaves_the_tag_alone() {
-    let h = harness().await;
-    stopped(&h);
-    let (status, _) = start(&h, ID, "").await;
-    assert_eq!(status, StatusCode::ACCEPTED);
-    assert!(h.fake.auto_stop_sets().is_empty());
-    assert_eq!(h.fake.actions(), [(ID.to_owned(), Action::Start)]);
-    // An empty object carries no hours either.
-    let h = harness().await;
-    stopped(&h);
-    assert_eq!(start(&h, ID, "{}").await.0, StatusCode::ACCEPTED);
-    assert!(h.fake.auto_stop_sets().is_empty());
-}
-
-#[tokio::test]
-async fn start_with_hours_sets_the_tag_before_it_starts() {
-    let h = harness().await;
-    stopped(&h);
-    let (status, vm) = start(&h, ID, r#"{"auto_stop_hours": 6}"#).await;
-    assert_eq!(status, StatusCode::ACCEPTED);
-    assert_eq!(vm["auto_stop_hours"], 6);
-    // The tag call came before the first action.
-    assert_eq!(h.fake.auto_stop_sets(), [(ID.to_owned(), 6, 0)]);
-    assert_eq!(h.fake.actions(), [(ID.to_owned(), Action::Start)]);
+async fn start_without_a_body_just_starts() {
+    for body in ["", "{}"] {
+        let h = harness().await;
+        stopped(&h);
+        assert_eq!(start(&h, ID, body).await.0, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(h.fake.actions(), [(ID.to_owned(), Action::Start)], "{body}");
+    }
 }
 
 #[tokio::test]
@@ -1028,29 +1014,17 @@ async fn start_with_invalid_hours_is_400_and_does_nothing() {
             "{body}"
         );
     }
-    assert!(h.fake.auto_stop_sets().is_empty());
     assert!(h.fake.actions().is_empty());
 }
 
 #[tokio::test]
-async fn start_with_hours_on_a_running_vm_is_409_without_a_tag() {
+async fn start_with_hours_on_a_running_vm_is_409() {
     let h = harness().await;
     h.fake.seed(stage_vm(ID, "lima", "running", "t3a.medium"));
     let (status, body) = start(&h, ID, r#"{"auto_stop_hours": 6}"#).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body, json!({ "error": "vm is running" }));
-    assert!(h.fake.auto_stop_sets().is_empty());
-}
-
-#[tokio::test]
-async fn a_failed_tag_call_stops_the_start() {
-    let h = harness().await;
-    stopped(&h);
-    h.fake.fail_auto_stop(true);
-    let (status, body) = start(&h, ID, r#"{"auto_stop_hours": 6}"#).await;
-    assert_eq!((status, body), (StatusCode::BAD_GATEWAY, aws_failed()));
     assert!(h.fake.actions().is_empty());
-    assert_eq!(h.fake.instance(ID).unwrap().state, "stopped");
 }
 
 #[tokio::test]
