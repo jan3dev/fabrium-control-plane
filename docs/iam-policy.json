@@ -64,7 +64,7 @@
       "Resource": "arn:aws:ec2:us-east-2:<ACCOUNT_ID>:instance/*",
       "Condition": {
         "Null": { "aws:ResourceTag/fabrium:tenant": "false", "aws:TagKeys": "false" },
-        "ForAllValues:StringEquals": { "aws:TagKeys": ["fabrium:setup"] }
+        "ForAllValues:StringEquals": { "aws:TagKeys": ["fabrium:setup", "fabrium:auto-stop-hours"] }
       }
     },
     {

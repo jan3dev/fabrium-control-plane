@@ -101,7 +101,7 @@ A key works only from the sources of its tenant. `API_SOURCES` lists `<tenant>:<
 | Parameter | Value | Source |
 |---|---|---|
 | Region | `us-east-2` | `AWS_REGION` |
-| AMI | The newest image that the account owns with the name `ubuntu-24.04-jan3-dev-env-v3` | `AMI_NAME` |
+| AMI | The newest image that the account owns with the name `ubuntu-24.04-jan3-dev-env-v4` | `AMI_NAME` |
 | Instance type | From the request. Default `t3a.medium`. | `INSTANCE_TYPES`, `DEFAULT_INSTANCE_TYPE` |
 | SEV-SNP | `CpuOptions.AmdSevSnp=enabled` for the sizes that AWS lists: `c6a.large` to `c6a.16xlarge`, `m6a.large` to `m6a.8xlarge`, `r6a.large` to `r6a.4xlarge`. Only in `us-east-2` and `eu-west-1`. | Code |
 | Security group | `jan3-dev-env-ssh` | `SECURITY_GROUP` |
@@ -123,7 +123,7 @@ These values move the logic of `scripts/create-vm.sh`, `scripts/start-vm.sh`, an
 | `PUBLIC_URL` | `https://<host>` | Base URL that VMs use to redeem tokens. |
 | `AWS_REGION` | `us-east-2` | |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | None | Temporary credentials for now. The dedicated profile replaces them. |
-| `AMI_NAME` | `ubuntu-24.04-jan3-dev-env-v3` | |
+| `AMI_NAME` | `ubuntu-24.04-jan3-dev-env-v4` | |
 | `INSTANCE_TYPES` | `t3a.medium,t3a.large,t3.medium,t3.large,m6a.large,c6a.large,r6a.large` | The allowlist. |
 | `DEFAULT_INSTANCE_TYPE` | `t3a.medium` | Must be in the allowlist. |
 | `SECURITY_GROUP` | `jan3-dev-env-ssh` | |
@@ -135,7 +135,7 @@ The production profile gets the policy in Appendix A. In short:
 
 - `Describe*` on `*`, because EC2 has no resource-level permissions for describe actions.
 - `RunInstances` needs the request tag `fabrium:tenant`, IMDSv2, and an instance type of an allowed family. It accepts only images that the account owns with the tag `Project=jan3-dev-env`, one security group, and one key pair.
-- `CreateTags` only during a launch, plus the single key `fabrium:setup` on instances that have `fabrium:tenant`.
+- `CreateTags` only during a launch, plus the keys `fabrium:setup` and `fabrium:auto-stop-hours` on instances that have `fabrium:tenant`.
 - Start, stop, reboot, and terminate only on instances that have `fabrium:tenant`.
 - No `iam:PassRole`, because VMs get no instance profile.
 - The code enforces the tenant isolation. IAM keeps the control plane away from every instance that Fabrium did not launch or adopt.
@@ -384,7 +384,7 @@ Replace `<ACCOUNT_ID>` and `<SECURITY_GROUP_ID>`. Validate with IAM Access Analy
       "Resource": "arn:aws:ec2:us-east-2:<ACCOUNT_ID>:instance/*",
       "Condition": {
         "Null": { "aws:ResourceTag/fabrium:tenant": "false", "aws:TagKeys": "false" },
-        "ForAllValues:StringEquals": { "aws:TagKeys": ["fabrium:setup"] }
+        "ForAllValues:StringEquals": { "aws:TagKeys": ["fabrium:setup", "fabrium:auto-stop-hours"] }
       }
     },
     {

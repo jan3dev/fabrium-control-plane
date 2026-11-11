@@ -65,6 +65,8 @@ pub struct Instance {
     pub launched_at: DateTime,
     /// Tag `fabrium:setup` is `delivered`.
     pub setup_delivered: bool,
+    /// Tag `fabrium:auto-stop-hours`. `None` if it is missing or not an integer.
+    pub auto_stop_hours: Option<u32>,
 }
 
 pub struct TypeSpec {
@@ -81,6 +83,8 @@ pub struct Launch {
     pub instance_type: String,
     /// The user data script, base64 encoded.
     pub user_data: String,
+    /// Value of the tag `fabrium:auto-stop-hours`.
+    pub auto_stop_hours: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +129,8 @@ pub trait Ec2: Send + Sync {
     async fn act(&self, id: &str, action: Action) -> anyhow::Result<()>;
     /// Sets the tag `fabrium:setup=delivered`.
     async fn mark_setup_delivered(&self, id: &str) -> anyhow::Result<()>;
+    /// Sets the tag `fabrium:auto-stop-hours`.
+    async fn set_auto_stop_hours(&self, id: &str, hours: u32) -> anyhow::Result<()>;
 }
 
 #[cfg(test)]

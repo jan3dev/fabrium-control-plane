@@ -86,7 +86,7 @@ impl VmConfig {
         Ok(Self {
             public_url: public_url_base(&public_url)?,
             aws_region,
-            ami_name: var("AMI_NAME", "ubuntu-24.04-jan3-dev-env-v3"),
+            ami_name: var("AMI_NAME", "ubuntu-24.04-jan3-dev-env-v4"),
             instance_types,
             default_instance_type,
             security_group: var("SECURITY_GROUP", "jan3-dev-env-ssh"),
@@ -287,7 +287,7 @@ mod tests {
         let vm = load(&[]).unwrap().vm;
         assert_eq!(vm.public_url, URL);
         assert_eq!(vm.aws_region, "us-east-2");
-        assert_eq!(vm.ami_name, "ubuntu-24.04-jan3-dev-env-v3");
+        assert_eq!(vm.ami_name, "ubuntu-24.04-jan3-dev-env-v4");
         assert_eq!(
             vm.instance_types,
             [

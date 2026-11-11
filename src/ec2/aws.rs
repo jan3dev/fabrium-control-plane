@@ -14,8 +14,8 @@ use aws_sdk_ec2::{
     types::{
         self, AmdSevSnpSpecification, BlockDeviceMapping, CpuOptionsRequest, EbsBlockDevice,
         Filter, HttpTokensState, Image, InstanceMetadataEndpointState,
-        InstanceMetadataOptionsRequest, InstanceType, ResourceType, Tag, TagSpecification,
-        VolumeType,
+        InstanceMetadataOptionsRequest, InstanceMetadataTagsState, InstanceType, ResourceType, Tag,
+        TagSpecification, VolumeType,
     },
 };
 use aws_smithy_http_client::{Builder, tls};
@@ -26,6 +26,7 @@ use crate::config::VmConfig;
 /// The value of the `Project` tag on every VM, volume, and image of this service. The IAM
 /// policy lets `RunInstances` use only images that carry it.
 const PROJECT: &str = "jan3-dev-env";
+const AUTO_STOP_TAG: &str = "fabrium:auto-stop-hours";
 
 /// The states that the VM list shows. `terminated` is left out on purpose.
 const LISTED_STATES: [&str; 5] = ["pending", "running", "shutting-down", "stopping", "stopped"];
@@ -117,6 +118,7 @@ fn to_instance(i: &types::Instance) -> Instance {
         // Whole seconds: EC2 sends milliseconds.
         launched_at: DateTime::from_secs(i.launch_time().map_or(0, DateTime::secs)),
         setup_delivered: tag("fabrium:setup") == Some("delivered"),
+        auto_stop_hours: tag(AUTO_STOP_TAG).and_then(|v| v.parse().ok()),
     }
 }
 
@@ -136,6 +138,7 @@ fn run_instances(
             .tags(tag("Name", &launch.name))
             .tags(tag("Project", PROJECT))
             .tags(tag("fabrium:tenant", &launch.tenant))
+            .tags(tag(AUTO_STOP_TAG, &launch.auto_stop_hours.to_string()))
             .build()
     };
     let disk = EbsBlockDevice::builder()
@@ -146,6 +149,7 @@ fn run_instances(
     let imds = InstanceMetadataOptionsRequest::builder()
         .http_tokens(HttpTokensState::Required)
         .http_endpoint(InstanceMetadataEndpointState::Enabled)
+        .instance_metadata_tags(InstanceMetadataTagsState::Enabled)
         .build();
     let request = client
         .run_instances()
@@ -289,6 +293,7 @@ impl Ec2 for AwsEc2 {
         // What we asked for is the source of truth, not the tags of the response.
         instance.name.clone_from(&launch.name);
         instance.tenant = Some(launch.tenant.clone());
+        instance.auto_stop_hours = Some(launch.auto_stop_hours);
         Ok(instance)
     }
 
@@ -314,6 +319,22 @@ impl Ec2 for AwsEc2 {
         let tag = Tag::builder()
             .key("fabrium:setup")
             .value("delivered")
+            .build();
+        (self
+            .client
+            .create_tags()
+            .resources(id)
+            .tags(tag)
+            .send()
+            .await)
+            .map(|_| ())
+            .map_err(aws_err("CreateTags"))
+    }
+
+    async fn set_auto_stop_hours(&self, id: &str, hours: u32) -> Result<()> {
+        let tag = Tag::builder()
+            .key(AUTO_STOP_TAG)
+            .value(hours.to_string())
             .build();
         (self
             .client
@@ -439,6 +460,7 @@ mod tests {
             tenant: "stage".into(),
             instance_type: instance_type.into(),
             user_data: "dXNlcg==".into(),
+            auto_stop_hours: 12,
         }
     }
 
@@ -482,6 +504,10 @@ mod tests {
             imds.http_endpoint(),
             Some(&InstanceMetadataEndpointState::Enabled)
         );
+        assert_eq!(
+            imds.instance_metadata_tags(),
+            Some(&InstanceMetadataTagsState::Enabled)
+        );
         assert!(r.iam_instance_profile().is_none());
         let specs = r.tag_specifications();
         let kinds: Vec<_> = specs.iter().map(|s| s.resource_type().cloned()).collect();
@@ -499,6 +525,7 @@ mod tests {
                 ("Name", "lima"),
                 ("Project", "jan3-dev-env"),
                 ("fabrium:tenant", "stage"),
+                ("fabrium:auto-stop-hours", "12"),
             ];
             assert_eq!(tags, want);
         }
@@ -566,6 +593,7 @@ mod tests {
         assert_eq!(i.tenant.as_deref(), Some("stage"));
         assert_eq!(i.public_ip.as_deref(), Some("203.0.113.10"));
         assert!(i.setup_delivered);
+        assert_eq!(i.auto_stop_hours, None);
         // Whole seconds only.
         assert_eq!(i.launched_at, DateTime::from_secs(1_793_041_200));
 
@@ -576,6 +604,12 @@ mod tests {
                 .tags(other)
                 .build(),
         );
+        let hours = |v: &str| {
+            let t = tag("fabrium:auto-stop-hours", v);
+            to_instance(&types::Instance::builder().tags(t).build()).auto_stop_hours
+        };
+        assert_eq!(hours("8"), Some(8));
+        assert_eq!((hours("soon"), hours("-1"), hours("")), (None, None, None));
         assert_eq!(bare.name, "");
         assert_eq!(
             (bare.tenant, bare.public_ip, bare.setup_delivered),
@@ -786,6 +820,24 @@ mod tests {
             &format!("ResourceId.1={ID}"),
             "Tag.1.Key=fabrium%3Asetup",
             "Tag.1.Value=delivered",
+        ] {
+            assert!(has(body, want), "{want}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn set_auto_stop_hours_sets_the_tag() {
+        let (ec2, http) = replay(&[ok("CreateTagsResponse", "<return>true</return>")]);
+        ec2.set_auto_stop_hours(ID, 8).await.unwrap();
+        let bodies = sent(&http);
+        let [body] = &bodies[..] else {
+            panic!("expected one request")
+        };
+        for want in [
+            "Action=CreateTags",
+            &format!("ResourceId.1={ID}"),
+            "Tag.1.Key=fabrium%3Aauto-stop-hours",
+            "Tag.1.Value=8",
         ] {
             assert!(has(body, want), "{want}: {body}");
         }
