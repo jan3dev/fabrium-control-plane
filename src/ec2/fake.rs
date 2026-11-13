@@ -52,8 +52,6 @@ struct Inner {
     fail: bool,
     fail_writes: bool,
     fail_tagging: bool,
-    fail_auto_stop: bool,
-    auto_stop_sets: Vec<(String, u32, usize)>,
     hang_tagging: bool,
     launch_delay: Duration,
     hide_launches: bool,
@@ -111,14 +109,12 @@ impl FakeEc2 {
         self.inner().fail_tagging = on;
     }
 
-    /// While on, `set_auto_stop_hours` returns an error.
-    pub fn fail_auto_stop(&self, on: bool) {
-        self.inner().fail_auto_stop = on;
-    }
-
-    /// Each `set_auto_stop_hours` call as (id, hours, number of actions done before it).
-    pub fn auto_stop_sets(&self) -> Vec<(String, u32, usize)> {
-        self.inner().auto_stop_sets.clone()
+    /// Moves an instance to `state`, as EC2 does on its own.
+    pub fn set_state(&self, id: &str, state: &str) {
+        let mut inner = self.inner();
+        if let Some(found) = inner.instances.iter_mut().find(|i| i.id == id) {
+            found.state = state.to_owned();
+        }
     }
 
     /// While on, `mark_setup_delivered` never finishes.
@@ -225,18 +221,6 @@ impl Ec2 for FakeEc2 {
         let found = (inner.instances.iter_mut().find(|i| i.id == id))
             .with_context(|| format!("no instance {id}"))?;
         found.setup_delivered = true;
-        Ok(())
-    }
-
-    async fn set_auto_stop_hours(&self, id: &str, hours: u32) -> Result<()> {
-        self.check()?;
-        let mut inner = self.inner();
-        ensure!(!inner.fail_auto_stop, "fake EC2 tagging failure");
-        let done = inner.actions.len();
-        let found = (inner.instances.iter_mut().find(|i| i.id == id))
-            .with_context(|| format!("no instance {id}"))?;
-        found.auto_stop_hours = Some(hours);
-        inner.auto_stop_sets.push((id.to_owned(), hours, done));
         Ok(())
     }
 }

@@ -7,7 +7,7 @@ use axum::{
     Router,
     extract::DefaultBodyLimit,
     middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 
 use crate::{AppState, auth, ec2::Action};
@@ -24,6 +24,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/vms/{id}/start", vms::action(Action::Start))
         .route("/v1/vms/{id}/stop", vms::action(Action::Stop))
         .route("/v1/vms/{id}/reboot", vms::action(Action::Reboot))
+        .route("/v1/vms/{id}/auto-stop", put(vms::set_auto_stop))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_key,
@@ -31,6 +32,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health::health))
         .route("/v1/bootstrap", post(redeem::redeem))
+        .route("/v1/vm/auto-stop", get(redeem::auto_stop))
         .merge(protected)
         .with_state(state)
 }

@@ -129,8 +129,6 @@ pub trait Ec2: Send + Sync {
     async fn act(&self, id: &str, action: Action) -> anyhow::Result<()>;
     /// Sets the tag `fabrium:setup=delivered`.
     async fn mark_setup_delivered(&self, id: &str) -> anyhow::Result<()>;
-    /// Sets the tag `fabrium:auto-stop-hours`.
-    async fn set_auto_stop_hours(&self, id: &str, hours: u32) -> anyhow::Result<()>;
 }
 
 #[cfg(test)]

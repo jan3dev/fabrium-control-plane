@@ -18,6 +18,15 @@ pub enum AppError {
     /// The detail is for the log. The body says only that the request failed.
     #[error("aws request failed")]
     Aws(String),
+    /// The detail is for the log. The body says only that the request failed.
+    #[error("internal error")]
+    Internal(String),
+}
+
+impl From<sea_orm::DbErr> for AppError {
+    fn from(e: sea_orm::DbErr) -> Self {
+        Self::Internal(format!("database: {e}"))
+    }
 }
 
 impl From<anyhow::Error> for AppError {
@@ -42,6 +51,10 @@ impl IntoResponse for AppError {
             Self::Aws(detail) => {
                 tracing::error!(%detail, "aws request failed");
                 (StatusCode::BAD_GATEWAY, body).into_response()
+            }
+            Self::Internal(detail) => {
+                tracing::error!(%detail, "internal error");
+                (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
             }
         }
     }
