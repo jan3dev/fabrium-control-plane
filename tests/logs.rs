@@ -59,12 +59,25 @@ async fn logs_never_hold_a_token_a_key_or_the_payload() {
     h.fake.fail_tagging(true);
     redeem(&h, &token).await;
     settle().await; // the tag call runs after the answer
-    // A repeat from another address is refused, and logged with that address.
+    // A redeem from an address that is not the VM's is refused, and logged with both addresses.
+    let (id, own) = (vm["id"].as_str().unwrap(), vm_ip(&h, &token));
     redeem_from(&h, &token, "198.51.100.7").await;
+    // So is a redeem with no address, and one while EC2 shows no public IP for the VM.
+    let auth = format!("Bearer {token}");
+    call_from(&h.app, "POST", "/v1/bootstrap", Some(&auth), None).await;
+    h.fake.set_public_ip(id, None);
+    redeem_from(&h, &token, &own).await;
+    // The VM gets a new address and asks again in the grace time. Its first redeem came from
+    // another address, so a repeat is refused.
+    h.fake.set_public_ip(id, Some("198.51.100.8"));
+    redeem_from(&h, &token, "198.51.100.8").await;
     h.fake.fail(true);
     create(&h.app, STAGE, &create_body("other")).await;
     call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
     h.fake.fail(false);
+    // A valid key from an address that its tenant does not use, or from none, is refused and logged.
+    call_from(&h.app, "GET", "/v1/vms", Some(STAGE), Some(PROD_SOURCE)).await;
+    call_from(&h.app, "GET", "/v1/vms", Some(STAGE), None).await;
     let uri = format!("/v1/vms/{}", vm["id"].as_str().unwrap());
     call_raw(&h.app, "DELETE", &uri, Some(STAGE)).await;
     // A tag call that hangs is cut off after 5 s, and that is logged too.
@@ -86,11 +99,40 @@ async fn logs_never_hold_a_token_a_key_or_the_payload() {
         "aws request failed",
         "vm deleted",
         "timed out",
-        "refused a repeat redeem from another address",
-        "198.51.100.7",
     ];
     for line in lines {
         assert!(logs.contains(line), "no {line:?} in the log:\n{logs}");
+    }
+    // A refused redeem is logged with the VM, and with the addresses that there are.
+    let refusals = [
+        (
+            "from an address that is not the VM's",
+            format!("vm={id} from=198.51.100.7 vm_ip={own}"),
+        ),
+        ("no client address", format!("vm={id}")),
+        ("no public IP for the VM", format!("vm={id} from={own}")),
+        (
+            "refused a repeat redeem from another address",
+            format!("vm={id} from=198.51.100.8 first={own}"),
+        ),
+    ];
+    for (text, fields) in refusals {
+        let found = logs
+            .lines()
+            .any(|l| l.contains(text) && l.contains(&fields));
+        assert!(
+            found,
+            "no {text:?} line with {fields:?} in the log:\n{logs}"
+        );
+    }
+    // A refused source is logged with its tenant and its address, or `none`.
+    let refused: Vec<&str> = (logs.lines())
+        .filter(|l| l.contains("not a source of the tenant"))
+        .collect();
+    for from in [PROD_SOURCE, "none"] {
+        let want = format!("tenant=stage from={from}");
+        let found = refused.iter().any(|l| l.contains(&want));
+        assert!(found, "no refused line with {want:?} in the log:\n{logs}");
     }
     for secret in [
         token.as_str(),

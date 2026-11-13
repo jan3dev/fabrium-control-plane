@@ -201,6 +201,12 @@ impl Store {
         ))
     }
 
+    /// The instance of the live entry for `token`. This reads the entry and changes nothing: it
+    /// is not a redeem. `None` if the token is unknown or its entry has ended.
+    pub fn instance_of(&self, token: &str) -> Option<String> {
+        self.live().get(&hash(token)).map(|e| e.instance.clone())
+    }
+
     /// True if the instance has a live entry: a token that no VM has redeemed, or one in its
     /// grace time. In the grace time, the tag `fabrium:setup=delivered` may not show yet.
     pub fn has_live(&self, instance: &str) -> bool {
@@ -340,6 +346,42 @@ mod tests {
         store.insert("tok", payload(), "i-1", "stage", "lima");
         assert!(!store.has_live("i-1"));
         assert!(get(&store, "tok").is_none());
+    }
+
+    #[test]
+    fn instance_of_reads_a_live_entry_without_redeeming_it() {
+        // Without a grace time, a redeem would end the entry at once.
+        let store = Store::new(TTL).with_grace(Duration::ZERO);
+        store.insert("tok", payload(), "i-1", "stage", "lima");
+        assert_eq!(store.instance_of("tok").as_deref(), Some("i-1"));
+        assert_eq!(store.instance_of("tok").as_deref(), Some("i-1"));
+        assert_eq!(store.instance_of("other"), None);
+        assert_eq!(store.instance_of(""), None);
+        // The reads did not redeem: the first redeem still gets the payload.
+        assert!(get(&store, "tok").is_some());
+        assert_eq!(store.instance_of("tok"), None);
+    }
+
+    #[test]
+    fn instance_of_does_not_set_the_address_of_the_first_redeem() {
+        let store = Store::new(TTL);
+        store.insert("tok", payload(), "i-1", "stage", "lima");
+        assert!(store.instance_of("tok").is_some());
+        // The first redeem sets the address, whoever it is. It is not a repeat.
+        let first = store.redeem("tok", "198.51.100.7");
+        assert!(matches!(first, Some(Redeemed::Payload(..))));
+        // Now another address is a repeat.
+        let repeat = store.redeem("tok", VM);
+        assert!(matches!(repeat, Some(Redeemed::Refused { .. })));
+    }
+
+    #[test]
+    fn instance_of_is_none_for_an_ended_entry() {
+        let store = Store::new(Duration::ZERO);
+        store.insert("tok", payload(), "i-1", "stage", "lima");
+        assert_eq!(store.instance_of("tok"), None);
+        // Like every read, it drops the entries that have ended.
+        assert_eq!(store.entries().len(), 0);
     }
 
     #[test]
