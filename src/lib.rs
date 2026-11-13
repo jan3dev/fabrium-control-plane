@@ -5,6 +5,7 @@ pub mod db;
 pub mod ec2;
 pub mod error;
 mod http;
+pub mod registry;
 
 use std::{sync::Arc, time::Duration};
 

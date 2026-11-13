@@ -5,6 +5,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, header::AUTHORIZATION},
 };
+use serde::Serialize;
 use tracing::Instrument;
 
 use crate::{
@@ -13,6 +14,7 @@ use crate::{
     bootstrap::{Payload, Redeemed},
     ec2::{Ec2, Instance},
     error::AppError,
+    registry,
 };
 
 /// The longest that the tag call runs.
@@ -78,6 +80,26 @@ async fn vm_address(state: &AppState, headers: &HeaderMap, vm: &str) -> Result<I
 fn public_ip(instance: &Instance) -> Option<IpAddr> {
     let ip: IpAddr = instance.public_ip.as_deref()?.parse().ok()?;
     Some(ip.to_canonical())
+}
+
+#[derive(Serialize)]
+pub struct AutoStop {
+    auto_stop_hours: u32,
+}
+
+/// `GET /v1/vm/auto-stop`: a VM reads its hours with its VM token. No tenant key, and no
+/// source address check: a VM gets a new address after a stop. Every failure is a 404.
+pub async fn auto_stop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AutoStop>, AppError> {
+    let token = (headers.get(AUTHORIZATION))
+        .and_then(|v| v.to_str().ok())
+        .and_then(bearer_token)
+        .ok_or(AppError::NotFound)?;
+    let auto_stop_hours =
+        (registry::hours_by_token(&state.db, token).await?).ok_or(AppError::NotFound)?;
+    Ok(Json(AutoStop { auto_stop_hours }))
 }
 
 /// Sets the tag `fabrium:setup=delivered`. It only logs: the VM has its payload already.

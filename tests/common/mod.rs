@@ -234,6 +234,19 @@ pub fn stage_vm(id: &str, name: &str, state: &str, instance_type: &str) -> Insta
     fake::instance(id, name, Some("stage"), state, instance_type)
 }
 
+/// A redeemed payload without the files that the control plane adds under `/etc/fabrium/`.
+pub fn sent_part(payload: &Value) -> Value {
+    let mut payload = payload.clone();
+    let files = payload["files"].as_array_mut().expect("files");
+    files.retain(|f| {
+        !f["path"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("/etc/fabrium/")
+    });
+    payload
+}
+
 pub fn not_found() -> Value {
     json!({ "error": "not found" })
 }

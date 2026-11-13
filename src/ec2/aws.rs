@@ -330,22 +330,6 @@ impl Ec2 for AwsEc2 {
             .map(|_| ())
             .map_err(aws_err("CreateTags"))
     }
-
-    async fn set_auto_stop_hours(&self, id: &str, hours: u32) -> Result<()> {
-        let tag = Tag::builder()
-            .key(AUTO_STOP_TAG)
-            .value(hours.to_string())
-            .build();
-        (self
-            .client
-            .create_tags()
-            .resources(id)
-            .tags(tag)
-            .send()
-            .await)
-            .map(|_| ())
-            .map_err(aws_err("CreateTags"))
-    }
 }
 
 #[cfg(test)]
@@ -820,24 +804,6 @@ mod tests {
             &format!("ResourceId.1={ID}"),
             "Tag.1.Key=fabrium%3Asetup",
             "Tag.1.Value=delivered",
-        ] {
-            assert!(has(body, want), "{want}: {body}");
-        }
-    }
-
-    #[tokio::test]
-    async fn set_auto_stop_hours_sets_the_tag() {
-        let (ec2, http) = replay(&[ok("CreateTagsResponse", "<return>true</return>")]);
-        ec2.set_auto_stop_hours(ID, 8).await.unwrap();
-        let bodies = sent(&http);
-        let [body] = &bodies[..] else {
-            panic!("expected one request")
-        };
-        for want in [
-            "Action=CreateTags",
-            &format!("ResourceId.1={ID}"),
-            "Tag.1.Key=fabrium%3Aauto-stop-hours",
-            "Tag.1.Value=8",
         ] {
             assert!(has(body, want), "{want}: {body}");
         }
