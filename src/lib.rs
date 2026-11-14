@@ -9,6 +9,7 @@ pub mod factory;
 pub mod github;
 mod http;
 pub mod matrix;
+pub mod registry;
 
 use std::{sync::Arc, time::Duration};
 

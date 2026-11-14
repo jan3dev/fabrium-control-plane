@@ -34,6 +34,7 @@ pub fn instance(
         public_ip: None,
         launched_at: DateTime::from_secs(LAUNCHED_AT_SECS),
         setup_delivered: false,
+        auto_stop_hours: None,
     }
 }
 
@@ -108,6 +109,14 @@ impl FakeEc2 {
         self.inner().fail_tagging = on;
     }
 
+    /// Moves an instance to `state`, as EC2 does on its own.
+    pub fn set_state(&self, id: &str, state: &str) {
+        let mut inner = self.inner();
+        if let Some(found) = inner.instances.iter_mut().find(|i| i.id == id) {
+            found.state = state.to_owned();
+        }
+    }
+
     /// While on, `mark_setup_delivered` never finishes.
     pub fn hang_tagging(&self, on: bool) {
         self.inner().hang_tagging = on;
@@ -169,13 +178,16 @@ impl Ec2 for FakeEc2 {
             ensure!(!inner.fail_writes, "fake EC2 write failure");
             // 17 hex digits, like EC2. The `fa` prefix keeps these apart from seeded ids.
             let id = format!("i-fa{:015x}", inner.launches.len() + 1);
-            let launched = instance(
-                &id,
-                &launch.name,
-                Some(&launch.tenant),
-                "pending",
-                &launch.instance_type,
-            );
+            let launched = Instance {
+                auto_stop_hours: Some(launch.auto_stop_hours),
+                ..instance(
+                    &id,
+                    &launch.name,
+                    Some(&launch.tenant),
+                    "pending",
+                    &launch.instance_type,
+                )
+            };
             inner.instances.push(launched.clone());
             inner.launched_ids.push(id);
             inner.launches.push(launch.clone());
@@ -223,6 +235,7 @@ mod tests {
             tenant: "stage".to_owned(),
             instance_type: "t3a.medium".to_owned(),
             user_data: "dXNlcg==".to_owned(),
+            auto_stop_hours: 12,
         }
     }
 

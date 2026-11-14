@@ -25,6 +25,12 @@ pub enum AppError {
     Db(String),
 }
 
+impl From<sea_orm::DbErr> for AppError {
+    fn from(e: sea_orm::DbErr) -> Self {
+        Self::Db(format!("database: {e}"))
+    }
+}
+
 impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
         Self::Aws(format!("{e:#}"))

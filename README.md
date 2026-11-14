@@ -59,7 +59,7 @@ The database lives in the `data` Docker volume. It survives restarts.
 | `PUBLIC_URL` | none (required) | from `.env` | The base URL that VMs use to redeem their token. It must start with `https://` and must not hold a quote or a space. The service removes a trailing `/`. |
 | `AWS_REGION` | `us-east-2` | from `.env` | AWS has SEV-SNP on shared tenancy only in `us-east-2` and `eu-west-1`. In another region, the service refuses to start if `INSTANCE_TYPES` has a SEV-SNP type. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | none | from `.env` | The AWS SDK reads them from the environment. Temporary credentials expire. Put new ones in `.env` and recreate the container. |
-| `AMI_NAME` | `ubuntu-24.04-jan3-dev-env-v3` | from `.env` | The VM image. The service uses the newest available image that the account owns with this name and with the tag `Project=jan3-dev-env`. |
+| `AMI_NAME` | `ubuntu-24.04-jan3-dev-env-v4` | from `.env` | The VM image. The service uses the newest available image that the account owns with this name and with the tag `Project=jan3-dev-env`. |
 | `INSTANCE_TYPES` | `t3a.medium,t3a.large,t3.medium,t3.large,m6a.large,c6a.large,r6a.large` | from `.env` | The allowlist, in the order that the API shows it. Each entry is `<family>.<size>`. The family is `t3`, `t3a`, `c6a`, `m6a`, or `r6a`. The service refuses to start with another family or with a duplicate. |
 | `DEFAULT_INSTANCE_TYPE` | `t3a.medium` | from `.env` | Must be in `INSTANCE_TYPES`. |
 | `SECURITY_GROUP` | `jan3-dev-env-ssh` | from `.env` | The security group of new VMs, by name. |
@@ -102,11 +102,11 @@ cargo run -p migration -- down
 cargo run -p migration -- status
 ```
 
-The CLI reads `DATABASE_URL`. Migrations create `github_deliveries` and `factory_runs` when the factory is used. Generate further entities later with `sea-orm-cli`.
+The CLI reads `DATABASE_URL`. The service runs the migrations at start. The database holds the VM registry (see [Auto-stop](#auto-stop)); in Docker it is in the named volume `data`, which survives a new image. Migrations create `github_deliveries` and `factory_runs` when the factory is used. Generate further entities later with `sea-orm-cli`.
 
 ## API
 
-Every route except `/health`, `/v1/bootstrap`, and `/v1/github/webhook` needs `Authorization: Bearer <tenant API key>`. The server hashes the key with SHA-256 and compares it with the stored hashes. The scheme name is case-insensitive, and extra spaces before the key are ignored. A missing header, a wrong scheme, or an unknown key returns `401` with `WWW-Authenticate: Bearer` and `{"error":"missing or invalid API key"}`. The GitHub webhook uses `X-Hub-Signature-256` instead; see [docs/tech/agent-factory/listener.md](docs/tech/agent-factory/listener.md).
+Every route except `/health`, `/v1/bootstrap`, `/v1/vm/auto-stop`, and `/v1/github/webhook` needs `Authorization: Bearer <tenant API key>`. The server hashes the key with SHA-256 and compares it with the stored hashes. The scheme name is case-insensitive, and extra spaces before the key are ignored. A missing header, a wrong scheme, or an unknown key returns `401` with `WWW-Authenticate: Bearer` and `{"error":"missing or invalid API key"}`. The GitHub webhook uses `X-Hub-Signature-256` instead; see [docs/tech/agent-factory/listener.md](docs/tech/agent-factory/listener.md).
 
 | Method | Path | Success | Errors |
 |--------|------|---------|--------|
@@ -118,9 +118,11 @@ Every route except `/health`, `/v1/bootstrap`, and `/v1/github/webhook` needs `A
 | POST | `/v1/vms/{id}/start` | `202 vm` | `404`, `409`, `502` |
 | POST | `/v1/vms/{id}/stop` | `202 vm` | `404`, `409`, `502` |
 | POST | `/v1/vms/{id}/reboot` | `202 vm` | `404`, `409`, `502` |
+| PUT | `/v1/vms/{id}/auto-stop` | `200 vm` | `400`, `404`, `409`, `502` |
 | DELETE | `/v1/vms/{id}` | `202`, empty body | `404`, `502` |
 | POST | `/v1/bootstrap` | `200 {"files":[...],"script":"..."}` | `404` |
 | POST | `/v1/github/webhook` | `200 {"ok":true,…}` (GitHub App HMAC; no tenant key) | `403` bad signature, `404` if factory unset |
+| GET | `/v1/vm/auto-stop` | `200 {"auto_stop_hours":N}` | `404` |
 
 Every error body is `{"error":"<short message>"}`. A `413` can have a plain-text body. Clients must branch on the status code, not on the message.
 
@@ -137,7 +139,10 @@ A VM:
   "sev_snp": false,
   "public_ip": "203.0.113.10",
   "launched_at": "2026-10-26T19:00:00Z",
-  "setup": "delivered"
+  "setup": "delivered",
+  "auto_stop_hours": 12,
+  "creator": "@ann:example.org",
+  "registered": true
 }
 ```
 
@@ -146,6 +151,10 @@ A VM:
 - `launched_at` is the EC2 launch time in UTC, in whole seconds. EC2 resets it at each start.
 - `sev_snp` is `true` for the sizes that AWS launches with AMD SEV-SNP: `c6a.large` to `c6a.16xlarge`, `m6a.large` to `m6a.8xlarge`, and `r6a.large` to `r6a.4xlarge`. The service enables SEV-SNP for exactly those. A larger size of these families launches without it.
 - `setup` is `delivered` if the VM has the tag of a redeemed token, `pending` while its token is live (not redeemed yet, or in the 60 s after the first redeem, before the tag shows), and `expired` if not. An `expired` VM never got its payload. Delete it and create it again.
+
+- `auto_stop_hours` comes from the registry. For a VM without a registry row it is the value of the tag `fabrium:auto-stop-hours`, or `null` if the tag is missing or not an integer. The VM powers itself off when its uptime reaches this many hours. EC2 then shows it as `stopped`.
+- `creator` is the Matrix user that the create named, or `null`.
+- `registered` is `true` if the VM has a registry row. Only then can the API change its hours.
 
 An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and are cached after the first success.
 
@@ -159,6 +168,8 @@ An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and 
 {
   "name": "lima",
   "instance_type": "t3a.medium",
+  "auto_stop_hours": 12,
+  "creator": "@ann:example.org",
   "bootstrap": {
     "files": [
       { "path": "/home/ubuntu/zooid/.env", "mode": "600", "owner": "ubuntu", "content": "..." }
@@ -172,6 +183,8 @@ An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and 
 |-------|-------------------|
 | `name` | `^[a-z0-9][a-z0-9-]{0,62}$` |
 | `instance_type` | Optional. In `INSTANCE_TYPES`. The default is `DEFAULT_INSTANCE_TYPE`. |
+| `auto_stop_hours` | Optional integer from 1 to 168. The default is 12. |
+| `creator` | Optional. A Matrix user id: `@localpart:server`, printable ASCII without spaces, at most 255 bytes. |
 | `files[].path` | Starts with `/` and does not end with `/`. No `..` segment. No control character, such as a newline or a NUL byte. |
 | `files[].mode` | `^[0-7]{3,4}$` |
 | `files[].owner` | `^[a-z_][a-z0-9_-]{0,31}$` |
@@ -180,7 +193,7 @@ An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and 
 
 A body larger than 256 KiB gives `413`. If a VM of the same tenant that is not terminated has the name, the result is `409 {"error":"name in use"}`. A VM of another tenant, or a terminated VM, does not count. A VM that still waits for its token also holds its name, even if EC2 does not list it yet. A VM that you delete keeps its name until EC2 reports it as `terminated`, usually after about a minute, so a create with the same name right after a delete can give `409`.
 
-Creates run one at a time: one lock, held across the AWS calls (about 3 s), stops two requests with one name from both passing the name check. A create also runs in a task of its own, so the 10 s request timeout cannot separate the launch from the insert of the payload: a VM that EC2 accepted always has its payload, and never holds its name without one. The task keeps the lock until it ends, and the SDK timeouts bound that time. To run creates in parallel, use a lock per tenant and name. With more than one control plane instance, the lock must be shared.
+Creates run one at a time: one lock, held from the name check to the insert of the payload (about 3 s), stops two requests with one name from both passing the name check. A create also runs in a task of its own, so the 10 s request timeout cannot separate the launch from the insert of the payload: a VM that EC2 accepted always has its payload, and never holds its name without one. The task keeps the lock until the payload is in the store, and the SDK timeouts bound that time. To run creates in parallel, use a lock per tenant and name. With more than one control plane instance, the lock must be shared.
 
 ### Actions
 
@@ -196,6 +209,18 @@ Another state gives `409 {"error":"vm is <state>"}`. EC2 still reports the old s
 An `{id}` that does not match `^i-[0-9a-f]{8,17}$`, a VM of another tenant, a VM without the `fabrium:tenant` tag, and a terminated VM all give `404 {"error":"not found"}`. A response never shows that a VM of another tenant exists. The code checks the tag of every VM that EC2 returns. IAM backs this up.
 
 A failed AWS call gives `502 {"error":"aws request failed"}`. The AWS detail goes to the log.
+
+### Auto-stop
+
+The registry, a table in the database, holds the auto-stop hours (1 to 168) and the creator of each VM that the API launched, and the SHA-256 of a VM token. A watcher in the VM reads the hours with that token every 5 minutes and powers the VM off when the uptime reaches them. The shutdown behavior stays `stop`, so the VM ends as `stopped`.
+
+- A create writes the row and adds two root-owned files to the payload: `/etc/fabrium/vm-token` (mode `600`, 32 random bytes in base64url) and `/etc/fabrium/control-plane-url` (`PUBLIC_URL`). It also sets the tag `fabrium:auto-stop-hours` at launch, as a first value for the watcher, and turns on instance tags in IMDS (`InstanceMetadataTags=enabled`).
+- `GET /v1/vm/auto-stop` with `Authorization: Bearer <VM token>` returns `{"auto_stop_hours": N}`. It needs no tenant key and checks no address, because a VM gets a new address after a stop. Any other token gives `404`.
+- `PUT /v1/vms/{id}/auto-stop` with `{"auto_stop_hours": N}` changes the row. A VM without a row gives `409 {"error":"recreate the vm to change its auto-stop"}`: its watcher reads only its tag, and the service does not change tags after a launch.
+- `POST /v1/vms/{id}/start` takes an optional body `{"auto_stop_hours": N}` (`400` if not 1 to 168). For a VM with a row it changes the row before the start. For a VM without a row the hours are ignored and the VM starts.
+- A delete removes the row, so the VM token stops working.
+
+If a create launches the VM but cannot write the row, it logs an error and the VM shows `registered: false`. It still powers off at its tag value.
 
 ### Bootstrap
 
@@ -296,7 +321,7 @@ The compiler alone peaks at 8.3 GiB, so a machine with 8 GiB of RAM is not enoug
 
 - `Describe*` on every resource, because EC2 has no resource-level permissions for describe actions.
 - `RunInstances` only with the request tag `fabrium:tenant`, IMDSv2 required, and an instance type of an allowed family. It accepts only images that the account owns with the tag `Project=jan3-dev-env`, one security group, and one key pair.
-- `CreateTags` only during a launch, plus the single key `fabrium:setup` on instances that have `fabrium:tenant`.
+- `CreateTags` only during a launch, plus the key `fabrium:setup` on instances that have `fabrium:tenant`.
 - Start, stop, reboot, and terminate only on instances that have `fabrium:tenant`.
 - No `iam:PassRole`, because VMs get no instance profile.
 
