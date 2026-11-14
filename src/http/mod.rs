@@ -10,7 +10,7 @@ use axum::{
     routing::{delete, get, post, put},
 };
 
-use crate::{AppState, auth, ec2::Action};
+use crate::{AppState, auth, ec2::Action, github};
 
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
@@ -32,6 +32,10 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health::health))
         .route("/v1/bootstrap", post(redeem::redeem))
+        .route(
+            "/v1/github/webhook",
+            post(github::webhook::webhook).layer(DefaultBodyLimit::max(github::webhook::MAX_BODY)),
+        )
         .route("/v1/vm/auto-stop", get(redeem::auto_stop))
         .merge(protected)
         .with_state(state)

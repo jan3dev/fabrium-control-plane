@@ -3,8 +3,12 @@ pub mod bootstrap;
 pub mod config;
 pub mod db;
 pub mod ec2;
+pub mod entity;
 pub mod error;
+pub mod factory;
+pub mod github;
 mod http;
+pub mod matrix;
 pub mod registry;
 
 use std::{sync::Arc, time::Duration};
@@ -23,6 +27,8 @@ use tower_http::{
 };
 use tracing::Level;
 
+use crate::factory::FactoryRuntime;
+
 /// Upper bound for any request. Answers 503, not 408: 408 invites client retries.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -40,6 +46,8 @@ pub struct AppState {
     pub types: Arc<OnceCell<Vec<ec2::TypeSpec>>>,
     /// Held by `POST /v1/vms` from the name check to the launch.
     pub create_lock: Arc<Mutex<()>>,
+    /// Agent factory (GitHub webhook + Matrix wake). Absent when unset in the env.
+    pub factory: Option<Arc<FactoryRuntime>>,
 }
 
 impl AppState {
@@ -57,7 +65,13 @@ impl AppState {
             bootstrap: Arc::new(bootstrap::Store::new(bootstrap::TTL)),
             types: Arc::default(),
             create_lock: Arc::default(),
+            factory: None,
         }
+    }
+
+    pub fn with_factory(mut self, factory: FactoryRuntime) -> Self {
+        self.factory = Some(Arc::new(factory));
+        self
     }
 }
 

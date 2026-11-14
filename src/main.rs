@@ -1,7 +1,13 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use fabrium_control_plane::{AppState, build_app, config::Config, db, ec2::AwsEc2};
+use fabrium_control_plane::{
+    AppState, build_app,
+    config::Config,
+    db,
+    ec2::AwsEc2,
+    factory::{FactoryRuntime, reconciler},
+};
 use tokio::{net::TcpListener, signal};
 use tracing_subscriber::EnvFilter;
 
@@ -26,10 +32,22 @@ async fn main() -> Result<()> {
         "vm settings"
     );
     let ec2 = Arc::new(AwsEc2::connect(vm).await);
-    let app = build_app(AppState::new(db, config.api_keys, config.vm, ec2));
+    let bind_addr = config.bind_addr;
+    let mut state = AppState::new(db, config.api_keys, config.vm, ec2);
+    if let Some(factory) = config.factory {
+        tracing::info!(
+            repos = ?factory.github.factory_repos,
+            app_id = factory.github.app_id,
+            "factory enabled"
+        );
+        let runtime = Arc::new(FactoryRuntime::new(factory)?);
+        reconciler::spawn(runtime.clone(), state.db.clone());
+        state.factory = Some(runtime);
+    }
+    let app = build_app(state);
 
-    let listener = TcpListener::bind(config.bind_addr).await?;
-    tracing::info!(addr = %config.bind_addr, "listening");
+    let listener = TcpListener::bind(bind_addr).await?;
+    tracing::info!(addr = %bind_addr, "listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
         .await?;
