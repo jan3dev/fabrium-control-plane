@@ -166,9 +166,8 @@ pub struct Client {
 }
 
 /// The client: the last `X-Forwarded-For` entry, with an IPv4-mapped IPv6 address as IPv4.
-/// Caddy sets this header and the app port listens on loopback only, so the last entry is the
-/// real client. Entries that the caller sent come before it. `None` if the header is missing
-/// or the last entry is not an IP address.
+/// Caddy sets it, so it is the real client (README, "Deploy on the control host"). `None` if
+/// the header is missing or the last entry is not an IP address.
 pub(crate) fn client_address(headers: &HeaderMap) -> Option<IpAddr> {
     let line = headers.get_all("x-forwarded-for").iter().next_back()?;
     let entry = line.to_str().ok()?.rsplit(',').next()?;
@@ -391,8 +390,7 @@ mod tests {
 
     #[test]
     fn sources_reject_zero_padded_octets() {
-        // The standard library refuses `010`, which some tools read as octal. So do the sources,
-        // with a prefix and without one.
+        // Like std, the sources refuse `010` (octal to some tools), with or without a prefix.
         for bad in [
             "zooid:198.51.100.010/32",
             "zooid:198.51.100.010",

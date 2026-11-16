@@ -197,8 +197,7 @@ impl Ec2 for FakeEc2 {
             let mut inner = self.inner();
             ensure!(!inner.fail_writes, "fake EC2 write failure");
             let n = inner.launches.len() + 1;
-            // The 254 addresses of 203.0.113.0/24 (RFC 5737), one for each launch: a test can tell
-            // the VMs apart. A launch after the last would repeat one.
+            // One 203.0.113.0/24 address (RFC 5737) per launch, so tests tell the VMs apart.
             ensure!(n < 255, "fake EC2 has no public IP left");
             // 17 hex digits, like EC2. The `fa` prefix keeps these apart from seeded ids.
             let id = format!("i-fa{n:015x}");

@@ -67,8 +67,7 @@ async fn logs_never_hold_a_token_a_key_or_the_payload() {
     call_from(&h.app, "POST", "/v1/bootstrap", Some(&auth), None).await;
     h.fake.set_public_ip(id, None);
     redeem_from(&h, &token, &own).await;
-    // The VM gets a new address and asks again in the grace time. Its first redeem came from
-    // another address, so a repeat is refused.
+    // In the grace time the VM gets a new address, so its repeat is refused.
     h.fake.set_public_ip(id, Some("198.51.100.8"));
     redeem_from(&h, &token, "198.51.100.8").await;
     h.fake.fail(true);

@@ -156,8 +156,7 @@ async fn every_tenant_route_checks_the_key_and_the_source() {
     // The refused requests changed nothing.
     assert!(h.fake.launches().is_empty());
     assert!(h.fake.actions().is_empty());
-    // From a source of the tenant no route refuses the key, so each route exists and the loops
-    // above tested it.
+    // From a tenant source no route refuses the key, so every route above exists.
     for (method, uri, body) in &routes {
         let from = Some(STAGE_SOURCE);
         let (status, _) = send_from(&h.app, method, uri, Some(STAGE), from, body.clone()).await;
@@ -984,8 +983,7 @@ async fn a_redeem_from_another_address_is_refused_and_keeps_the_token() {
     let id = vm["id"].as_str().unwrap();
     let token = token_in(&h.fake.launches()[0].user_data);
     let own = vm_ip(&h, &token);
-    // A thief that holds the token, from the address of a tenant, of a neighbor of the VM, of
-    // another range, and from IPv6. An entry that the thief puts before its own does not count.
+    // A token thief from a tenant, a VM neighbor, another range, IPv6, or behind a forged entry.
     for from in [
         "198.51.100.7",
         "192.0.2.10",
@@ -1157,8 +1155,7 @@ async fn a_vm_with_a_new_address_in_the_grace_time_is_refused() {
     let token = token_in(&h.fake.launches()[0].user_data);
     let first = vm_ip(&h, &token);
     assert_eq!(redeem(&h, &token).await.0, StatusCode::OK);
-    // EC2 gives the VM a new address, as at a stop and a start. The new address is the VM's, but
-    // the first redeem came from another one.
+    // EC2 gives the VM a new address (stop and start); the first redeem came from the old one.
     h.fake.set_public_ip(id, Some("198.51.100.8"));
     let (status, body) = redeem_from(&h, &token, "198.51.100.8").await;
     assert_eq!((status, body), (StatusCode::NOT_FOUND, not_found()));

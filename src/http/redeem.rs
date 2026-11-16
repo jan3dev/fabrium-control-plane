@@ -26,9 +26,7 @@ pub async fn redeem(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Payload>, AppError> {
-    // Every refusal is the same 404: no header, an unknown or ended token, no address or another
-    // one, a foreign repeat. A refused attempt does not use the token up. A failed AWS lookup is a
-    // 502, and only the holder of a live token can reach it.
+    // Every refusal is the same 404 and keeps the token (README, "Bootstrap").
     let token = (headers.get(AUTHORIZATION))
         .and_then(|v| v.to_str().ok())
         .and_then(bearer_token)
