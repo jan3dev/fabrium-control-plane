@@ -8,7 +8,7 @@ use axum::{
     http::StatusCode,
 };
 use sea_orm::{DbErr, SqlErr};
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 
 use super::vms;
 use crate::{
@@ -56,9 +56,14 @@ fn check(ok: bool, message: &str) -> Result<(), AppError> {
         .ok_or_else(|| AppError::BadRequest(message.to_owned()))
 }
 
+/// The body, which must be a JSON object: serde also reads a struct from a positional array.
 /// A fixed message: a serde error can echo a value of the body.
-fn invalid_body(_: serde_json::Error) -> AppError {
-    AppError::BadRequest("invalid request body".to_owned())
+fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, AppError> {
+    let invalid = || AppError::BadRequest("invalid request body".to_owned());
+    if body.trim_ascii_start().first() != Some(&b'{') {
+        return Err(invalid());
+    }
+    serde_json::from_slice(body).map_err(|_| invalid())
 }
 
 /// `^[a-z][a-z0-9-]{0,31}$`
@@ -155,7 +160,7 @@ pub async fn create(
     Extension(client): Extension<Client>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Agent>), AppError> {
-    let request: CreateAgent = serde_json::from_slice(&body).map_err(invalid_body)?;
+    let request: CreateAgent = parse(&body)?;
     check(
         valid_name(&request.name),
         "name must match ^[a-z][a-z0-9-]{0,31}$",
@@ -197,7 +202,7 @@ pub async fn change(
     body: Bytes,
 ) -> Result<Json<Agent>, AppError> {
     let id = agent_id(id)?;
-    let request: ChangeAgent = serde_json::from_slice(&body).map_err(invalid_body)?;
+    let request: ChangeAgent = parse(&body)?;
     // `""` clears a tag or a project, so only a value that is not empty has the label rules.
     let labels = [request.tag.as_deref(), request.project.as_deref()];
     let labels = labels.map(|label| label.filter(|l| !l.is_empty()));

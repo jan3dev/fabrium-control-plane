@@ -183,6 +183,17 @@ async fn create_refuses_bad_fields() {
         with("reviewer", |b| b["description"] = json!(long_description)),
         with("reviewer", |b| b["id"] = json!("0".repeat(32))),
         json!([agent_body("reviewer")]),
+        // serde reads a struct from a positional array too: this one has the right shape.
+        json!([
+            "reviewer",
+            "@ana:example.org",
+            "glm-5-3",
+            "",
+            null,
+            null,
+            null,
+            null
+        ]),
     ];
     for body in &cases {
         let (status, error) = post(&h, STAGE, body).await;
@@ -191,7 +202,7 @@ async fn create_refuses_bad_fields() {
     }
     assert_eq!(list(&h, STAGE).await, json!([]));
     // A serde error never reaches the body.
-    for body in [&cases[2], &cases[15], &cases[16]] {
+    for body in [&cases[2], &cases[15], &cases[16], &cases[17]] {
         let invalid = json!({ "error": "invalid request body" });
         assert_eq!(post(&h, STAGE, body).await.1, invalid, "{body}");
     }
@@ -345,9 +356,12 @@ async fn an_assign_sets_the_vm_and_the_rooms_once() {
         (&changed["vm"], &changed["rooms"]),
         (&first["vm"], &first["rooms"])
     );
-    // A second assign, to another VM or to the same one, changes nothing.
+    // A second assign, to another VM or to the same one, changes nothing. The change is one
+    // statement, so the other fields of the body do not apply either.
     let vm_already_set = (StatusCode::CONFLICT, json!({ "error": "vm already set" }));
-    for second in [placement("cusco", json!([])), first.clone()] {
+    let mut other = placement("cusco", json!([]));
+    other["description"] = json!("d2");
+    for second in [other, first.clone()] {
         assert_eq!(
             put(&h, STAGE, &agent, &second).await,
             vm_already_set,
@@ -356,6 +370,7 @@ async fn an_assign_sets_the_vm_and_the_rooms_once() {
     }
     let now = stored(&h, STAGE, &agent).await;
     assert_eq!((&now["vm"], &now["rooms"]), (&first["vm"], &first["rooms"]));
+    assert_eq!(now["description"], agent["description"]);
 }
 
 #[tokio::test]
@@ -390,6 +405,8 @@ async fn a_change_refuses_bad_fields() {
         placement("Lima", json!([])),
         placement("lima", json!(["general"])),
         json!([]),
+        // serde reads a struct from a positional array too: this one has the right shape.
+        json!(["@luis:example.org", null, null, null, null, null, null]),
     ];
     for body in &cases {
         let (status, error) = put(&h, STAGE, &agent, body).await;
@@ -397,6 +414,10 @@ async fn a_change_refuses_bad_fields() {
         assert!(error["error"].is_string(), "{body}");
     }
     assert_eq!(stored(&h, STAGE, &agent).await, agent);
+    for body in [&cases[10], &cases[11]] {
+        let invalid = json!({ "error": "invalid request body" });
+        assert_eq!(put(&h, STAGE, &agent, body).await.1, invalid, "{body}");
+    }
     // An empty change is no change.
     assert_eq!(
         put(&h, STAGE, &agent, &json!({})).await,
