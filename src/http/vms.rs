@@ -124,7 +124,7 @@ fn valid_id(id: &str) -> bool {
 
 /// An id that does not decode, such as `%FF`, is a bad id like any other: a `404`, not the
 /// plain-text `400` of the extractor.
-fn id_of(id: Result<Path<String>, PathRejection>) -> Result<String, AppError> {
+pub(crate) fn id_of(id: Result<Path<String>, PathRejection>) -> Result<String, AppError> {
     id.map(|Path(id)| id).map_err(|_| AppError::NotFound)
 }
 

@@ -219,22 +219,278 @@ async fn a_description_of_the_limit_is_stored() {
 #[tokio::test]
 async fn the_agent_routes_need_the_tenant_key() {
     let h = harness().await;
-    let (status, _) = call(&h.app, "GET", "/v1/agents", None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    // A key works only from a source of its tenant.
-    let body = serde_json::to_vec(&agent_body("reviewer")).unwrap();
-    for method in ["GET", "POST"] {
+    let agent = created(&h, STAGE, &agent_body("reviewer")).await;
+    let uri = format!("/v1/agents/{}", agent["id"].as_str().unwrap());
+    let create = serde_json::to_vec(&agent_body("other")).unwrap();
+    let change = br#"{"description":"d2"}"#.to_vec();
+    let routes = [
+        ("GET", "/v1/agents", Vec::new()),
+        ("POST", "/v1/agents", create),
+        ("PUT", uri.as_str(), change),
+        ("DELETE", uri.as_str(), Vec::new()),
+    ];
+    for (method, uri, body) in &routes {
+        let sent = send_from(&h.app, method, uri, None, Some(STAGE_SOURCE), body.clone()).await;
+        assert_eq!(sent.0, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        // A key works only from a source of its tenant.
         let from = Some(PROD_SOURCE);
-        let sent = send_from(
-            &h.app,
-            method,
-            "/v1/agents",
-            Some(STAGE),
-            from,
-            body.clone(),
-        )
-        .await;
-        assert_eq!(sent.0, StatusCode::FORBIDDEN, "{method}");
+        let sent = send_from(&h.app, method, uri, Some(STAGE), from, body.clone()).await;
+        assert_eq!(sent.0, StatusCode::FORBIDDEN, "{method} {uri}");
     }
+    assert_eq!(list(&h, STAGE).await, json!([agent]));
+}
+
+/// `PUT /v1/agents/{id}` with a raw body.
+async fn put_raw(h: &Harness, auth: &str, id: &str, body: Vec<u8>) -> (StatusCode, Value) {
+    let uri = format!("/v1/agents/{id}");
+    let (status, bytes) = send(&h.app, "PUT", &uri, Some(auth), body).await;
+    let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+async fn put(h: &Harness, auth: &str, agent: &Value, body: &Value) -> (StatusCode, Value) {
+    let id = agent["id"].as_str().unwrap();
+    put_raw(h, auth, id, serde_json::to_vec(body).unwrap()).await
+}
+
+async fn delete(h: &Harness, auth: &str, id: &str) -> (StatusCode, Vec<u8>) {
+    call_raw(&h.app, "DELETE", &format!("/v1/agents/{id}"), Some(auth)).await
+}
+
+/// The agent as the list of its tenant shows it.
+async fn stored(h: &Harness, auth: &str, agent: &Value) -> Value {
+    let agents = list(h, auth).await;
+    let found = agents
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == agent["id"]);
+    found.expect("the agent is listed").clone()
+}
+
+/// Moves `created_at` and `updated_at` of a row to the year 2000, so that a change shows.
+async fn backdate(h: &Harness, agent: &Value) -> Value {
+    set_created_at(h, agent, "2000-01-01T00:00:00Z").await;
+    let id = agent["id"].as_str().unwrap();
+    let sql = format!("UPDATE agents SET updated_at = '2000-01-01T00:00:00Z' WHERE id = '{id}'");
+    h.state.db.execute_unprepared(&sql).await.unwrap();
+    stored(h, STAGE, agent).await
+}
+
+fn placement(vm: &str, rooms: Value) -> Value {
+    json!({ "vm": vm, "rooms": rooms })
+}
+
+#[tokio::test]
+async fn a_change_keeps_the_fields_that_it_does_not_name() {
+    let h = harness().await;
+    let body = with("reviewer", |b| {
+        b["tag"] = json!("Reviewer");
+        b["project"] = json!("Payments");
+    });
+    let agent = created(&h, STAGE, &body).await;
+    let before = backdate(&h, &agent).await;
+    let (status, changed) = put(&h, STAGE, &agent, &json!({ "description": "d2" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(changed["description"], "d2");
+    for key in [
+        "id",
+        "name",
+        "owner",
+        "model",
+        "tag",
+        "project",
+        "vm",
+        "rooms",
+        "created_at",
+    ] {
+        assert_eq!(changed[key], before[key], "{key}");
+    }
+    assert_ne!(changed["updated_at"], before["updated_at"]);
+    assert_eq!(stored(&h, STAGE, &agent).await, changed);
+    // The other fields change too.
+    let body = json!({ "owner": "@luis:example.org", "model": "glm-5-4", "tag": "Lead", "project": "Ops" });
+    let (status, changed) = put(&h, STAGE, &agent, &body).await;
+    assert_eq!(status, StatusCode::OK);
+    for key in ["owner", "model", "tag", "project"] {
+        assert_eq!(changed[key], body[key], "{key}");
+    }
+}
+
+#[tokio::test]
+async fn an_empty_tag_clears_it() {
+    let h = harness().await;
+    let body = with("reviewer", |b| {
+        b["tag"] = json!("Reviewer");
+        b["project"] = json!("Payments");
+    });
+    let agent = created(&h, STAGE, &body).await;
+    let (status, changed) = put(&h, STAGE, &agent, &json!({ "tag": "", "project": "" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        (&changed["tag"], &changed["project"]),
+        (&Value::Null, &Value::Null)
+    );
+    assert_eq!(stored(&h, STAGE, &agent).await["tag"], Value::Null);
+}
+
+#[tokio::test]
+async fn an_assign_sets_the_vm_and_the_rooms_once() {
+    let h = harness().await;
+    let agent = created(&h, STAGE, &agent_body("reviewer")).await;
+    let first = placement("lima", json!(["#general:example.org"]));
+    let (status, changed) = put(&h, STAGE, &agent, &first).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        (&changed["vm"], &changed["rooms"]),
+        (&first["vm"], &first["rooms"])
+    );
+    // A second assign, to another VM or to the same one, changes nothing.
+    let vm_already_set = (StatusCode::CONFLICT, json!({ "error": "vm already set" }));
+    for second in [placement("cusco", json!([])), first.clone()] {
+        assert_eq!(
+            put(&h, STAGE, &agent, &second).await,
+            vm_already_set,
+            "{second}"
+        );
+    }
+    let now = stored(&h, STAGE, &agent).await;
+    assert_eq!((&now["vm"], &now["rooms"]), (&first["vm"], &first["rooms"]));
+}
+
+#[tokio::test]
+async fn an_assign_to_a_vm_that_has_the_name_is_refused() {
+    let h = harness().await;
+    let on_lima = with("reviewer", |b| {
+        b["vm"] = json!("lima");
+        b["rooms"] = json!([]);
+    });
+    created(&h, STAGE, &on_lima).await;
+    let profile = created(&h, STAGE, &agent_body("reviewer")).await;
+    assert_eq!(
+        put(&h, STAGE, &profile, &placement("lima", json!([]))).await,
+        (StatusCode::CONFLICT, json!({ "error": "name in use" }))
+    );
+    assert_eq!(stored(&h, STAGE, &profile).await, profile);
+}
+
+#[tokio::test]
+async fn a_change_refuses_bad_fields() {
+    let h = harness().await;
+    let agent = created(&h, STAGE, &agent_body("reviewer")).await;
+    let cases = [
+        json!({ "name": "x" }),
+        json!({ "vm": "lima" }),
+        json!({ "rooms": [] }),
+        json!({ "model": "" }),
+        json!({ "owner": "ana" }),
+        json!({ "tag": "a\u{7}" }),
+        json!({ "description": format!("{}a", "é".repeat(8192)) }),
+        placement("", json!([])),
+        placement("Lima", json!([])),
+        placement("lima", json!(["general"])),
+        json!([]),
+    ];
+    for body in &cases {
+        let (status, error) = put(&h, STAGE, &agent, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(error["error"].is_string(), "{body}");
+    }
+    assert_eq!(stored(&h, STAGE, &agent).await, agent);
+    // An empty change is no change.
+    assert_eq!(
+        put(&h, STAGE, &agent, &json!({})).await,
+        (StatusCode::OK, agent.clone())
+    );
+    // A refused "vm": "" left the agent a profile, so a real assign still works.
+    let (status, changed) = put(&h, STAGE, &agent, &placement("lima", json!([]))).await;
+    assert_eq!((status, &changed["vm"]), (StatusCode::OK, &json!("lima")));
+}
+
+#[tokio::test]
+async fn a_delete_removes_the_record() {
+    let h = harness().await;
+    let agent = created(&h, STAGE, &agent_body("reviewer")).await;
+    let id = agent["id"].as_str().unwrap();
+    assert_eq!(
+        delete(&h, STAGE, id).await,
+        (StatusCode::NO_CONTENT, Vec::new())
+    );
     assert_eq!(list(&h, STAGE).await, json!([]));
+    let (status, body) = delete(&h, STAGE, id).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), not_found());
+}
+
+#[tokio::test]
+async fn another_tenant_gets_not_found() {
+    let h = harness().await;
+    let agent = created(&h, STAGE, &agent_body("reviewer")).await;
+    let id = agent["id"].as_str().unwrap();
+    let body = json!({ "description": "d2" });
+    assert_eq!(
+        put(&h, PROD, &agent, &body).await,
+        (StatusCode::NOT_FOUND, not_found())
+    );
+    assert_eq!(delete(&h, PROD, id).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(list(&h, PROD).await, json!([]));
+    assert_eq!(list(&h, STAGE).await, json!([agent]));
+}
+
+#[tokio::test]
+async fn an_id_of_another_form_is_not_found() {
+    let h = harness().await;
+    created(&h, STAGE, &agent_body("reviewer")).await;
+    let upper = "A".repeat(32);
+    for id in ["abc", "%FF", upper.as_str(), &"0".repeat(33)] {
+        // The id is checked before the body.
+        let (status, body) = put_raw(&h, STAGE, id, b"not json".to_vec()).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::NOT_FOUND, not_found()),
+            "PUT {id}"
+        );
+        let (status, body) = delete(&h, STAGE, id).await;
+        let body = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(
+            (status, body),
+            (StatusCode::NOT_FOUND, not_found()),
+            "DELETE {id}"
+        );
+    }
+    // An unknown id of the right form is not found too.
+    let unknown = "0".repeat(32);
+    let (status, body) = put_raw(&h, STAGE, &unknown, b"{}".to_vec()).await;
+    assert_eq!((status, body), (StatusCode::NOT_FOUND, not_found()));
+    assert_eq!(list(&h, STAGE).await.as_array().unwrap().len(), 1);
+}
+
+/// A valid agent write of exactly `len` bytes: the JSON of `body`, then spaces.
+fn padded(body: &Value, len: usize) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(body).unwrap();
+    bytes.resize(len, b' ');
+    bytes
+}
+
+#[tokio::test]
+async fn the_agent_writes_take_at_most_128_kib() {
+    let h = harness().await;
+    let limit = 128 * 1024;
+    let body = agent_body("reviewer");
+    assert_eq!(
+        post_raw(&h, STAGE, padded(&body, limit)).await.0,
+        StatusCode::CREATED
+    );
+    let over = post_raw(&h, STAGE, padded(&body, limit + 1)).await.0;
+    assert_eq!(over, StatusCode::PAYLOAD_TOO_LARGE);
+    let agent = &list(&h, STAGE).await[0];
+    let id = agent["id"].as_str().unwrap();
+    let change = json!({ "description": "d2" });
+    assert_eq!(
+        put_raw(&h, STAGE, id, padded(&change, limit)).await.0,
+        StatusCode::OK
+    );
+    let over = put_raw(&h, STAGE, id, padded(&change, limit + 1)).await.0;
+    assert_eq!(over, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(list(&h, STAGE).await.as_array().unwrap().len(), 1);
 }

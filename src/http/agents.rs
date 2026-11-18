@@ -1,14 +1,19 @@
 //! The agent records of the tenant. The control plane checks the fields. zooid checks who may
 //! do what: it holds the roles.
 
-use axum::{Extension, Json, body::Bytes, extract::State, http::StatusCode};
+use axum::{
+    Extension, Json,
+    body::Bytes,
+    extract::{Path, State, rejection::PathRejection},
+    http::StatusCode,
+};
 use sea_orm::{DbErr, SqlErr};
 use serde::Deserialize;
 
 use super::vms;
 use crate::{
     AppState,
-    agents::{self, Agent, NewAgent},
+    agents::{self, Agent, Changes, NewAgent},
     auth::Client,
     error::AppError,
 };
@@ -27,6 +32,19 @@ struct CreateAgent {
     model: String,
     #[serde(default)]
     description: String,
+    tag: Option<String>,
+    project: Option<String>,
+    vm: Option<String>,
+    rooms: Option<Vec<String>>,
+}
+
+/// Every field is optional. An absent field keeps its value.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChangeAgent {
+    owner: Option<String>,
+    description: Option<String>,
+    model: Option<String>,
     tag: Option<String>,
     project: Option<String>,
     vm: Option<String>,
@@ -163,4 +181,58 @@ pub async fn create(
     let agent = (agents::insert(&state.db, &client.name, &new).await).map_err(name_in_use)?;
     tracing::info!(tenant = %client.name, agent = %agent.id, "agent created");
     Ok((StatusCode::CREATED, Json(agent)))
+}
+
+/// `^[0-9a-f]{32}$`. Any other id, one that does not decode included, is not found.
+fn agent_id(id: Result<Path<String>, PathRejection>) -> Result<String, AppError> {
+    let id = vms::id_of(id)?;
+    let valid = id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    valid.then_some(id).ok_or(AppError::NotFound)
+}
+
+pub async fn change(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    id: Result<Path<String>, PathRejection>,
+    body: Bytes,
+) -> Result<Json<Agent>, AppError> {
+    let id = agent_id(id)?;
+    let request: ChangeAgent = serde_json::from_slice(&body).map_err(invalid_body)?;
+    // `""` clears a tag or a project, so only a value that is not empty has the label rules.
+    let labels = [request.tag.as_deref(), request.project.as_deref()];
+    let labels = labels.map(|label| label.filter(|l| !l.is_empty()));
+    let (owner, model) = (request.owner.as_deref(), request.model.as_deref());
+    check_fields(owner, request.description.as_deref(), model, labels)?;
+    let changes = Changes {
+        placement: placement(request.vm, request.rooms)?,
+        owner: request.owner,
+        description: request.description,
+        model: request.model,
+        tag: request.tag,
+        project: request.project,
+    };
+    let tenant = &client.name;
+    if !(agents::update(&state.db, tenant, &id, &changes).await).map_err(name_in_use)? {
+        // No row changed: the agent is not there, or the change sets a `vm` that it has.
+        return Err(match agents::get(&state.db, tenant, &id).await? {
+            Some(_) => AppError::Conflict("vm already set".to_owned()),
+            None => AppError::NotFound,
+        });
+    }
+    let agent = (agents::get(&state.db, tenant, &id).await?).ok_or(AppError::NotFound)?;
+    tracing::info!(%tenant, agent = %id, "agent changed");
+    Ok(Json(agent))
+}
+
+pub async fn delete(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    id: Result<Path<String>, PathRejection>,
+) -> Result<StatusCode, AppError> {
+    let id = agent_id(id)?;
+    if !agents::remove(&state.db, &client.name, &id).await? {
+        return Err(AppError::NotFound);
+    }
+    tracing::info!(tenant = %client.name, agent = %id, "agent deleted");
+    Ok(StatusCode::NO_CONTENT)
 }

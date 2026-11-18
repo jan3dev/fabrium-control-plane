@@ -108,3 +108,77 @@ pub async fn get(db: &DatabaseConnection, tenant: &str, id: &str) -> Result<Opti
         .await?;
     row.as_ref().map(agent).transpose()
 }
+
+/// `None` keeps a value. For `tag` and `project`, `Some("")` stores NULL.
+#[derive(Default)]
+pub struct Changes {
+    pub owner: Option<String>,
+    pub description: Option<String>,
+    pub model: Option<String>,
+    pub tag: Option<String>,
+    pub project: Option<String>,
+    pub placement: Option<(String, Vec<String>)>,
+}
+
+/// One UPDATE. With `placement`, it applies only to a row whose `vm` is NULL. `false`: no row
+/// changed. With no change, it reports whether the row exists.
+pub async fn update(
+    db: &DatabaseConnection,
+    tenant: &str,
+    id: &str,
+    changes: &Changes,
+) -> Result<bool, DbErr> {
+    let label = |value: &String| (!value.is_empty()).then(|| value.clone());
+    let mut sets: Vec<(&str, Value)> = Vec::new();
+    if let Some(owner) = &changes.owner {
+        sets.push(("owner", owner.as_str().into()));
+    }
+    if let Some(description) = &changes.description {
+        sets.push(("description", description.as_str().into()));
+    }
+    if let Some(model) = &changes.model {
+        sets.push(("model", model.as_str().into()));
+    }
+    if let Some(tag) = &changes.tag {
+        sets.push(("tag", label(tag).into()));
+    }
+    if let Some(project) = &changes.project {
+        sets.push(("project", label(project).into()));
+    }
+    if let Some((vm, rooms)) = &changes.placement {
+        sets.push(("vm", vm.as_str().into()));
+        sets.push(("rooms", rooms_text(rooms).into()));
+    }
+    if sets.is_empty() {
+        let sql = "SELECT id FROM agents WHERE tenant = ? AND id = ?";
+        let row = (db.query_one_raw(stmt(sql, vec![tenant.into(), id.into()]))).await?;
+        return Ok(row.is_some());
+    }
+    let columns: Vec<_> = sets
+        .iter()
+        .map(|(column, _)| format!("{column} = ?"))
+        .collect();
+    let only_profile = if changes.placement.is_some() {
+        " AND vm IS NULL"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "UPDATE agents SET {}, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+         WHERE tenant = ? AND id = ?{only_profile}",
+        columns.join(", ")
+    );
+    let mut values: Vec<Value> = sets.into_iter().map(|(_, value)| value).collect();
+    values.extend([tenant.into(), id.into()]);
+    let done = db.execute_raw(stmt(&sql, values)).await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// `false`: no such row.
+pub async fn remove(db: &DatabaseConnection, tenant: &str, id: &str) -> Result<bool, DbErr> {
+    let sql = "DELETE FROM agents WHERE tenant = ? AND id = ?";
+    let done = db
+        .execute_raw(stmt(sql, vec![tenant.into(), id.into()]))
+        .await?;
+    Ok(done.rows_affected() > 0)
+}

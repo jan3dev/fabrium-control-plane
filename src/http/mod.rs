@@ -31,6 +31,12 @@ pub fn router(state: AppState) -> Router {
             get(agents::list)
                 .merge(post(agents::create).layer(DefaultBodyLimit::max(agents::MAX_BODY))),
         )
+        .route(
+            "/v1/agents/{id}",
+            put(agents::change)
+                .layer(DefaultBodyLimit::max(agents::MAX_BODY))
+                .merge(delete(agents::delete)),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_key,
