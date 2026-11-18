@@ -259,7 +259,7 @@ struct CreateVm {
 }
 
 /// `@localpart:server` in printable ASCII, at most 255 bytes (the Matrix limit).
-fn valid_creator(id: &str) -> bool {
+pub(crate) fn valid_creator(id: &str) -> bool {
     id.len() <= 255
         && id.bytes().all(|b| b.is_ascii_graphic())
         && (id.strip_prefix('@'))
@@ -267,8 +267,8 @@ fn valid_creator(id: &str) -> bool {
             .is_some_and(|(local, server)| !local.is_empty() && !server.is_empty())
 }
 
-/// `^[a-z0-9][a-z0-9-]{0,62}$`
-fn valid_name(name: &str) -> bool {
+/// `^[a-z0-9][a-z0-9-]{0,62}$`. The `vm` of an agent has the same rule.
+pub(crate) fn valid_name(name: &str) -> bool {
     let b = name.as_bytes();
     (1..=63).contains(&b.len())
         && b[0] != b'-'
