@@ -206,7 +206,7 @@ Creates run one at a time: one lock, held from the name check to the insert of t
 - A VM without a registry row gives `409 {"error":"vm has no registry row"}`, and nothing changes. Delete it and create it again.
 - If the launch fails after the terminate, the answer is `502`. The old VM is gone, with its registry row. Its agents keep their records. Once EC2 reports the old VM as `terminated`, a create with the same name brings the VM back.
 
-A replace holds the lock of the creates from the read of the registry row to the insert of the new payload, so two replaces of one VM launch one VM: the second gets the `409`. It runs in a task of its own, as a create does.
+A replace holds the lock of the creates from the read of the registry row to the insert of the new payload, so two replaces of one VM launch one VM: the second gets the `409`. A delete holds the same lock from the terminate to the drop of the row, so a replace that comes after a delete of the same VM gets the `409` too, and a delete that comes after a replace terminates the old VM and keeps the new one. A replace runs in a task of its own, as a create does.
 
 ### Actions
 

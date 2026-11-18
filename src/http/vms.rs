@@ -237,6 +237,9 @@ pub async fn delete(
 ) -> Result<StatusCode, AppError> {
     let id = id_of(id)?;
     let vm = find(&state, &client.name, &id).await?;
+    // Under the create lock: a recreate of this VM reads its registry row before the
+    // terminate, or after the row is gone, and then answers 409 and launches nothing.
+    let _guard = state.create_lock.lock().await;
     state.ec2.act(&vm.id, Action::Terminate).await?;
     // The VM is gone, so nobody can redeem its payload. A failed terminate keeps the entry.
     state.bootstrap.remove_instance(&vm.id);
