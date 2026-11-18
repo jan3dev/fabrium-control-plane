@@ -356,8 +356,7 @@ async fn an_assign_sets_the_vm_and_the_rooms_once() {
         (&changed["vm"], &changed["rooms"]),
         (&first["vm"], &first["rooms"])
     );
-    // A second assign, to another VM or to the same one, changes nothing. The change is one
-    // statement, so the other fields of the body do not apply either.
+    // A second assign changes nothing, the other fields of its body included: it is one statement.
     let vm_already_set = (StatusCode::CONFLICT, json!({ "error": "vm already set" }));
     let mut other = placement("cusco", json!([]));
     other["description"] = json!("d2");

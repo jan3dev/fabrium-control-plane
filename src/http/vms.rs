@@ -237,14 +237,12 @@ pub async fn delete(
 ) -> Result<StatusCode, AppError> {
     let id = id_of(id)?;
     let vm = find(&state, &client.name, &id).await?;
-    // Under the create lock: a recreate of this VM reads its registry row before the
-    // terminate, or after the row is gone, and then answers 409 and launches nothing.
+    // Under the create lock, a recreate of this VM sees the row before the terminate or not at all.
     let _guard = state.create_lock.lock().await;
     state.ec2.act(&vm.id, Action::Terminate).await?;
     // The VM is gone, so nobody can redeem its payload. A failed terminate keeps the entry.
     state.bootstrap.remove_instance(&vm.id);
-    // The VM is terminated already: a failed delete only leaves a token that reads the hours
-    // and the agents of the name.
+    // The VM is gone: a failed drop only leaves a token that reads hours and agents.
     if let Err(e) = registry::remove(&state.db, &vm.id).await {
         tracing::error!(vm = %vm.id, error = %e, "could not drop the registry row");
     }
@@ -443,8 +441,7 @@ pub async fn recreate(
         .bootstrap
         .validate()
         .map_err(|e| AppError::BadRequest(e.to_owned()))?;
-    // The row is read under the lock: the first of two recreates of one VM drops it, so the
-    // second gets the 409 and launches nothing.
+    // Read under the lock: of two recreates of one VM, the second finds no row and gets 409.
     let guard = state.create_lock.clone().lock_owned().await;
     let record = (registry::get(&state.db, &client.name, &old.id).await?)
         .ok_or_else(|| AppError::Conflict("vm has no registry row".to_owned()))?;
@@ -454,8 +451,7 @@ pub async fn recreate(
         async move {
             state.ec2.act(&old.id, Action::Terminate).await?;
             state.bootstrap.remove_instance(&old.id);
-            // The VM is terminated already: a failed delete only leaves a token that reads the
-            // hours and the agents of the name.
+            // The VM is gone: a failed drop only leaves a token that reads hours and agents.
             if let Err(e) = registry::remove(&state.db, &old.id).await {
                 tracing::error!(vm = %old.id, error = %e, "could not drop the registry row");
             }

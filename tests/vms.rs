@@ -1625,8 +1625,7 @@ async fn concurrent_recreates_of_one_vm_launch_once() {
 async fn delete_waits_for_the_create_lock() {
     let h = harness().await;
     let id = lima(&h).await;
-    // A create or a recreate holds the lock: the delete terminates only after it. So a
-    // recreate never reads the registry row of a VM that a delete has terminated already.
+    // The delete terminates only after the create releases the lock.
     let lock = h.state.create_lock.clone().lock_owned().await;
     let (app, uri) = (h.app.clone(), format!("/v1/vms/{id}"));
     let delete = tokio::spawn(async move { call_raw(&app, "DELETE", &uri, Some(STAGE)).await.0 });
