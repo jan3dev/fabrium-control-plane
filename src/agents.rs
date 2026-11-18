@@ -101,6 +101,15 @@ pub async fn of_tenant(db: &DatabaseConnection, tenant: &str) -> Result<Vec<Agen
     rows.iter().map(agent).collect()
 }
 
+/// The agents of a VM name, sorted by name.
+pub async fn of_vm(db: &DatabaseConnection, tenant: &str, vm: &str) -> Result<Vec<Agent>, DbErr> {
+    let sql = format!("SELECT {COLUMNS} FROM agents WHERE tenant = ? AND vm = ? ORDER BY name");
+    let rows = db
+        .query_all_raw(stmt(&sql, vec![tenant.into(), vm.into()]))
+        .await?;
+    rows.iter().map(agent).collect()
+}
+
 pub async fn get(db: &DatabaseConnection, tenant: &str, id: &str) -> Result<Option<Agent>, DbErr> {
     let sql = format!("SELECT {COLUMNS} FROM agents WHERE tenant = ? AND id = ?");
     let row = db

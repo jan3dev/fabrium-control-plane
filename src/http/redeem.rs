@@ -9,7 +9,7 @@ use serde::Serialize;
 use tracing::Instrument;
 
 use crate::{
-    AppState,
+    AppState, agents,
     auth::{bearer_token, client_address},
     bootstrap::{Payload, Redeemed},
     ec2::{Ec2, Instance},
@@ -85,19 +85,59 @@ pub struct AutoStop {
     auto_stop_hours: u32,
 }
 
+/// The VM token of a request. Its absence is a 404, as every other failure of the VM routes.
+fn vm_token(headers: &HeaderMap) -> Result<&str, AppError> {
+    (headers.get(AUTHORIZATION))
+        .and_then(|v| v.to_str().ok())
+        .and_then(bearer_token)
+        .ok_or(AppError::NotFound)
+}
+
 /// `GET /v1/vm/auto-stop`: a VM reads its hours with its VM token. No tenant key, and no
 /// source address check: a VM gets a new address after a stop. Every failure is a 404.
 pub async fn auto_stop(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<AutoStop>, AppError> {
-    let token = (headers.get(AUTHORIZATION))
-        .and_then(|v| v.to_str().ok())
-        .and_then(bearer_token)
-        .ok_or(AppError::NotFound)?;
+    let token = vm_token(&headers)?;
     let auto_stop_hours =
         (registry::hours_by_token(&state.db, token).await?).ok_or(AppError::NotFound)?;
     Ok(Json(AutoStop { auto_stop_hours }))
+}
+
+#[derive(Serialize)]
+pub struct VmAgents {
+    agents: Vec<VmAgent>,
+}
+
+/// What a VM needs to run an agent. No owner, tag, or project: the VM does not use them.
+#[derive(Serialize)]
+struct VmAgent {
+    name: String,
+    description: String,
+    model: String,
+    rooms: Vec<String>,
+}
+
+/// `GET /v1/vm/agents`: a VM reads the agents of its name, in its tenant, with its VM token.
+/// The same rules as `auto_stop`.
+pub async fn vm_agents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<VmAgents>, AppError> {
+    let token = vm_token(&headers)?;
+    let (tenant, vm) =
+        (registry::vm_by_token(&state.db, token).await?).ok_or(AppError::NotFound)?;
+    let agents = (agents::of_vm(&state.db, &tenant, &vm).await?)
+        .into_iter()
+        .map(|a| VmAgent {
+            name: a.name,
+            description: a.description,
+            model: a.model,
+            rooms: a.rooms,
+        })
+        .collect();
+    Ok(Json(VmAgents { agents }))
 }
 
 /// Sets the tag `fabrium:setup=delivered`. It only logs: the VM has its payload already.

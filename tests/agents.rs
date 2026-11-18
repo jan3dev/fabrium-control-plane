@@ -494,3 +494,116 @@ async fn the_agent_writes_take_at_most_128_kib() {
     assert_eq!(over, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(list(&h, STAGE).await.as_array().unwrap().len(), 1);
 }
+
+/// Creates the VM `name` as `stage`, redeems its bootstrap token, and returns its VM token.
+async fn vm_token_of(h: &Harness, name: &str) -> String {
+    let (status, vm) = create(&h.app, STAGE, &create_body(name)).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let launch = h.fake.launches().pop().expect("a launch");
+    let (status, payload) = redeem(h, &token_in(&launch.user_data)).await;
+    assert_eq!(status, StatusCode::OK);
+    let files = payload["files"].as_array().unwrap();
+    let file = files.iter().find(|f| f["path"] == "/etc/fabrium/vm-token");
+    file.expect("the VM token file")["content"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+async fn vm_agents(h: &Harness, token: &str) -> (StatusCode, Value) {
+    let auth = format!("Bearer {token}");
+    call(&h.app, "GET", "/v1/vm/agents", Some(&auth)).await
+}
+
+fn on(name: &str, vm: &str) -> Value {
+    with(name, |b| {
+        b["vm"] = json!(vm);
+        b["rooms"] = json!(["#general:example.org"]);
+        b["description"] = json!(format!("You are {name}."));
+    })
+}
+
+#[tokio::test]
+async fn a_vm_reads_its_own_agents() {
+    let h = harness().await;
+    let token = vm_token_of(&h, "lima").await;
+    for (name, vm) in [("b", "lima"), ("a", "lima"), ("c", "cusco")] {
+        created(&h, STAGE, &on(name, vm)).await;
+    }
+    created(&h, STAGE, &agent_body("d")).await;
+    let entry = |name: &str| {
+        json!({
+            "name": name,
+            "description": format!("You are {name}."),
+            "model": "glm-5-3",
+            "rooms": ["#general:example.org"],
+        })
+    };
+    let want = json!({ "agents": [entry("a"), entry("b")] });
+    assert_eq!(vm_agents(&h, &token).await, (StatusCode::OK, want));
+}
+
+#[tokio::test]
+async fn a_vm_without_agents_gets_an_empty_list() {
+    let h = harness().await;
+    let token = vm_token_of(&h, "lima").await;
+    created(&h, STAGE, &agent_body("profile")).await;
+    let empty = (StatusCode::OK, json!({ "agents": [] }));
+    assert_eq!(vm_agents(&h, &token).await, empty);
+}
+
+#[tokio::test]
+async fn a_vm_does_not_read_the_agents_of_the_same_name_in_another_tenant() {
+    let h = harness().await;
+    let token = vm_token_of(&h, "lima").await;
+    created(&h, PROD, &on("reviewer", "lima")).await;
+    let empty = (StatusCode::OK, json!({ "agents": [] }));
+    assert_eq!(vm_agents(&h, &token).await, empty);
+}
+
+#[tokio::test]
+async fn a_missing_or_unknown_token_is_not_found() {
+    let h = harness().await;
+    vm_token_of(&h, "lima").await;
+    created(&h, STAGE, &on("reviewer", "lima")).await;
+    let bootstrap = format!("Bearer {}", token_in(&h.fake.launches()[0].user_data));
+    for auth in [
+        None,
+        Some("Bearer nope"),
+        Some(STAGE),
+        Some(bootstrap.as_str()),
+    ] {
+        let (status, body) = call(&h.app, "GET", "/v1/vm/agents", auth).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::NOT_FOUND, not_found()),
+            "{auth:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_token_of_a_deleted_vm_is_not_found() {
+    let h = harness().await;
+    let token = vm_token_of(&h, "lima").await;
+    let agent = created(&h, STAGE, &on("reviewer", "lima")).await;
+    assert_eq!(vm_agents(&h, &token).await.0, StatusCode::OK);
+    let id = h.fake.launched()[0].id.clone();
+    let (status, _) = call(&h.app, "DELETE", &format!("/v1/vms/{id}"), Some(STAGE)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        vm_agents(&h, &token).await,
+        (StatusCode::NOT_FOUND, not_found())
+    );
+    // A delete of the VM keeps its agents.
+    assert_eq!(list(&h, STAGE).await, json!([agent]));
+}
+
+#[tokio::test]
+async fn the_route_needs_no_source_address() {
+    let h = harness().await;
+    let token = vm_token_of(&h, "lima").await;
+    let auth = format!("Bearer {token}");
+    let (status, body) = call_from(&h.app, "GET", "/v1/vm/agents", Some(&auth), None).await;
+    assert_eq!((status, body), (StatusCode::OK, json!({ "agents": [] })));
+}

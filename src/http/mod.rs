@@ -45,6 +45,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health::health))
         .route("/v1/bootstrap", post(redeem::redeem))
         .route("/v1/vm/auto-stop", get(redeem::auto_stop))
+        .route("/v1/vm/agents", get(redeem::vm_agents))
         .merge(protected)
         .with_state(state)
 }
