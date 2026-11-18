@@ -96,11 +96,11 @@ cargo run -p migration -- down
 cargo run -p migration -- status
 ```
 
-The CLI reads `DATABASE_URL`. The service runs the migrations at start. The database holds the VM registry (see [Auto-stop](#auto-stop)); in Docker it is in the named volume `data`, which survives a new image.
+The CLI reads `DATABASE_URL`. The service runs the migrations at start. The database holds the VM registry (see [Auto-stop](#auto-stop)) and the agent records (see [Agents](#agents)); in Docker it is in the named volume `data`, which survives a new image.
 
 ## API
 
-Every route except `/health`, `/v1/bootstrap`, and `/v1/vm/auto-stop` needs `Authorization: Bearer <tenant API key>`. The server hashes the key with SHA-256 and compares it with the stored hashes. The scheme name is case-insensitive, and extra spaces before the key are ignored. A missing header, a wrong scheme, or an unknown key returns `401` with `WWW-Authenticate: Bearer` and `{"error":"missing or invalid API key"}`.
+Every route except `/health`, `/v1/bootstrap`, `/v1/vm/auto-stop`, and `/v1/vm/agents` needs `Authorization: Bearer <tenant API key>`. The server hashes the key with SHA-256 and compares it with the stored hashes. The scheme name is case-insensitive, and extra spaces before the key are ignored. A missing header, a wrong scheme, or an unknown key returns `401` with `WWW-Authenticate: Bearer` and `{"error":"missing or invalid API key"}`.
 
 A valid key also needs a source address. The address is the last `X-Forwarded-For` entry, which Caddy sets. Caddy is the only way in, so that entry is the real client (see [Deploy on the control host](#deploy-on-the-control-host)). An IPv4-mapped IPv6 address counts as its IPv4 address. The service checks the address against the `API_SOURCES` entries of the tenant of the key. A request from another address, or with no usable address, returns `403 {"error":"forbidden"}`, and the service logs a warning with the tenant and the address. The key check comes first, so a bad key always returns `401`.
 
@@ -116,8 +116,14 @@ A valid key also needs a source address. The address is the last `X-Forwarded-Fo
 | POST | `/v1/vms/{id}/reboot` | `202 vm` | `404`, `409`, `502` |
 | PUT | `/v1/vms/{id}/auto-stop` | `200 vm` | `400`, `404`, `409`, `502` |
 | DELETE | `/v1/vms/{id}` | `202`, empty body | `404`, `502` |
+| POST | `/v1/vms/{id}/recreate` | `201 vm` | `400`, `404`, `409`, `413`, `502` |
+| GET | `/v1/agents` | `200 [agent]`, sorted by `created_at`, then `id` | |
+| POST | `/v1/agents` | `201 agent` | `400`, `409`, `413` |
+| PUT | `/v1/agents/{id}` | `200 agent` | `400`, `404`, `409`, `413` |
+| DELETE | `/v1/agents/{id}` | `204`, empty body | `404` |
 | POST | `/v1/bootstrap` | `200 {"files":[...],"script":"..."}` | `404`, `502` |
 | GET | `/v1/vm/auto-stop` | `200 {"auto_stop_hours":N}` | `404` |
+| GET | `/v1/vm/agents` | `200 {"agents":[...]}` | `404` |
 
 Every error body is `{"error":"<short message>"}`. A `413` can have a plain-text body. Clients must branch on the status code, not on the message.
 
@@ -190,6 +196,18 @@ A body larger than 256 KiB gives `413`. If a VM of the same tenant that is not t
 
 Creates run one at a time: one lock, held from the name check to the insert of the payload (about 3 s), stops two requests with one name from both passing the name check. A create also runs in a task of its own, so the 10 s request timeout cannot separate the launch from the insert of the payload: a VM that EC2 accepted always has its payload, and never holds its name without one. The task keeps the lock until the payload is in the store, and the SDK timeouts bound that time. To run creates in parallel, use a lock per tenant and name. With more than one control plane instance, the lock must be shared.
 
+### Replace a VM
+
+`POST /v1/vms/{id}/recreate` with `{"bootstrap": {...}}` terminates the VM and launches a new one in its place. It gives a VM new credentials. The files of the old VM are lost. It works in any state that the list shows, as a delete does.
+
+- What stays: the name, the instance type, and the creator and the auto-stop hours of the registry row (see [Auto-stop](#auto-stop)). The agents of the name stay too (see [Agents](#agents)).
+- What is new: the instance id, the payload of the body, the bootstrap token, and the VM token. The VM token of the old VM stops working.
+- The payload has the rules of a create, and a body larger than 256 KiB gives `413`. The service does not check the name, because the old VM holds it until EC2 reports it as `terminated`. It does not check the instance type against `INSTANCE_TYPES` either, because the list can change after the create.
+- A VM without a registry row gives `409 {"error":"vm has no registry row"}`, and nothing changes. Delete it and create it again.
+- If the launch fails after the terminate, the answer is `502`. The old VM is gone, with its registry row. Its agents keep their records. Once EC2 reports the old VM as `terminated`, a create with the same name brings the VM back.
+
+A replace holds the lock of the creates from the read of the registry row to the insert of the new payload, so two replaces of one VM launch one VM: the second gets the `409`. It runs in a task of its own, as a create does.
+
 ### Actions
 
 | Action | Allowed state | The `202` shows |
@@ -216,6 +234,43 @@ The registry, a table in the database, holds the auto-stop hours (1 to 168) and 
 - A delete removes the row, so the VM token stops working.
 
 If a create launches the VM but cannot write the row, it logs an error and the VM shows `registered: false`. It still powers off at its tag value.
+
+### Agents
+
+The control plane stores the agent records of each tenant and checks their fields. It does not check who may change a record: zooid does.
+
+```json
+{
+  "id": "5f0c2d7a9b3e4c1d8a6f0e2b4c6d8a0f",
+  "name": "reviewer",
+  "owner": "@ann:example.org",
+  "description": "You are an expert software engineer who does code reviews.",
+  "model": "glm-5-3",
+  "tag": "Reviewer",
+  "project": "Payments",
+  "vm": "lima",
+  "rooms": ["#general:example.org"],
+  "created_at": "2026-11-18T19:00:00Z",
+  "updated_at": "2026-11-18T19:00:00Z"
+}
+```
+
+A record holds the name of the agent, its owner (a Matrix user), its description (the instructions of the agent), its model, a tag and a project (labels, or `null`), and the name of its VM with the rooms that the agent joins. The service makes the `id`. The rules of each field, and the bodies of the writes, are in section 1 of [the agent contracts](docs/superpowers/plans/2026-11-18-agents-management-contracts.md). A field that breaks a rule gives `400`, and a body larger than 128 KiB gives `413`.
+
+- An agent without a VM is a profile: its `vm` is `null` and its `rooms` is `[]`. Two profiles can have the same name.
+- `POST /v1/agents` creates a profile, or an agent on a VM when the body has `vm` and `rooms`.
+- `PUT /v1/agents/{id}` changes the fields that the body names. `""` clears `tag` and `project`. It sets `vm` and `rooms` only on a profile: an agent that has a `vm` gives `409 {"error":"vm already set"}`. The name never changes.
+- A name is unique on a VM of a tenant: a second agent with that name on that VM gives `409 {"error":"name in use"}`. Another tenant, another VM, and a profile do not count.
+- The service does not check that `vm` names a live VM. A delete or a replace of a VM keeps its agents, and a new VM with that name gets them.
+- An agent of another tenant, and an `{id}` that is not 32 lowercase hex characters, give `404 {"error":"not found"}`.
+
+A VM reads its agents with its VM token (see [Auto-stop](#auto-stop)). `GET /v1/vm/agents` with `Authorization: Bearer <VM token>` returns the agents whose `vm` is the name of that VM, in its tenant, sorted by name, with only what the VM needs to run them:
+
+```json
+{ "agents": [ { "name": "reviewer", "description": "...", "model": "glm-5-3", "rooms": ["#general:example.org"] } ] }
+```
+
+It has the rules of `GET /v1/vm/auto-stop`: no tenant key, no source address check, and `404` for any other token. A VM without agents gets `{"agents":[]}`. The answer holds no secret.
 
 ### Bootstrap
 
