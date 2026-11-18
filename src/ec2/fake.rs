@@ -51,6 +51,7 @@ struct Inner {
     type_calls: usize,
     fail: bool,
     fail_writes: bool,
+    fail_launch: bool,
     fail_tagging: bool,
     hang_tagging: bool,
     launch_delay: Duration,
@@ -122,6 +123,11 @@ impl FakeEc2 {
     /// While on, `launch` and `act` return an error. Lookups still work.
     pub fn fail_writes(&self, on: bool) {
         self.inner().fail_writes = on;
+    }
+
+    /// While on, only `launch` returns an error.
+    pub fn fail_launch(&self, on: bool) {
+        self.inner().fail_launch = on;
     }
 
     /// While on, `mark_setup_delivered` returns an error.
@@ -196,6 +202,7 @@ impl Ec2 for FakeEc2 {
         let (launched, delay) = {
             let mut inner = self.inner();
             ensure!(!inner.fail_writes, "fake EC2 write failure");
+            ensure!(!inner.fail_launch, "fake EC2 launch failure");
             let n = inner.launches.len() + 1;
             // One 203.0.113.0/24 address (RFC 5737) per launch, so tests tell the VMs apart.
             ensure!(n < 255, "fake EC2 has no public IP left");
@@ -390,6 +397,11 @@ mod tests {
         assert!(fake.actions().is_empty());
         assert_eq!(fake.launches().len(), 1);
         fake.fail_writes(false);
+        fake.fail_launch(true);
+        assert!(fake.launch(&launch("b")).await.is_err());
+        fake.act(&i.id, Action::Stop).await.unwrap();
+        assert_eq!(fake.launches().len(), 1);
+        fake.fail_launch(false);
         fake.fail(true);
         assert!(fake.list("stage").await.is_err());
         assert!(fake.get(&i.id).await.is_err());
