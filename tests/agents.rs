@@ -558,6 +558,7 @@ async fn a_vm_reads_its_own_agents() {
             "description": format!("You are {name}."),
             "model": "glm-5-3",
             "rooms": ["#general:example.org"],
+            "senders": ["@ana:example.org"],
         })
     };
     let want = json!({ "agents": [entry("a"), entry("b")] });
@@ -810,4 +811,84 @@ async fn list_has_project(h: &Harness, id: &str) -> bool {
     let (status, projects) = call(&h.app, "GET", "/v1/projects", Some(STAGE)).await;
     assert_eq!(status, StatusCode::OK);
     projects.as_array().unwrap().iter().any(|p| p["id"] == id)
+}
+
+/// The entry of the agent `name` in the list of the VM.
+async fn vm_entry(h: &Harness, token: &str, name: &str) -> Value {
+    let (status, body) = vm_agents(h, token).await;
+    assert_eq!(status, StatusCode::OK);
+    let agents = body["agents"].as_array().unwrap();
+    let found = agents.iter().find(|a| a["name"] == name);
+    found.expect("the agent is in the list").clone()
+}
+
+#[tokio::test]
+async fn a_personal_agent_answers_only_its_owner() {
+    let h = harness().await;
+    let token = vm_token_of(&h, "lima").await;
+    created(&h, STAGE, &on("a", "lima")).await;
+    let entry = vm_entry(&h, &token, "a").await;
+    assert_eq!(entry["senders"], json!(["@ana:example.org"]));
+}
+
+#[tokio::test]
+async fn a_project_agent_has_null_senders() {
+    let h = harness().await;
+    let token = vm_token_of(&h, "lima").await;
+    let id = project(&h, STAGE, "Payments").await;
+    let mut body = on("b", "lima");
+    body["project_id"] = json!(id);
+    created(&h, STAGE, &body).await;
+    // The key is there, with null.
+    let entry = vm_entry(&h, &token, "b").await;
+    assert_eq!(entry.get("senders"), Some(&Value::Null));
+}
+
+#[tokio::test]
+async fn senders_follow_the_project_when_it_is_cleared_and_when_it_is_set() {
+    let h = harness().await;
+    let token = vm_token_of(&h, "lima").await;
+    let id = project(&h, STAGE, "Payments").await;
+    let mut body = on("b", "lima");
+    body["project_id"] = json!(id);
+    let agent = created(&h, STAGE, &body).await;
+    let (status, _) = put(&h, STAGE, &agent, &json!({ "project_id": "" })).await;
+    assert_eq!(status, StatusCode::OK);
+    // The owner stayed as data.
+    let entry = vm_entry(&h, &token, "b").await;
+    assert_eq!(entry["senders"], json!(["@ana:example.org"]));
+    let (status, _) = put(&h, STAGE, &agent, &json!({ "project_id": id })).await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = vm_entry(&h, &token, "b").await;
+    assert_eq!(entry.get("senders"), Some(&Value::Null));
+}
+
+#[tokio::test]
+async fn a_project_agent_hides_its_owner_from_the_vm() {
+    let h = harness().await;
+    let token = vm_token_of(&h, "lima").await;
+    let id = project(&h, STAGE, "Payments").await;
+    let mut body = on("b", "lima");
+    body["project_id"] = json!(id);
+    created(&h, STAGE, &body).await;
+    let entry = vm_entry(&h, &token, "b").await;
+    assert!(!entry.to_string().contains("@ana:example.org"), "{entry}");
+}
+
+#[tokio::test]
+async fn senders_are_per_tenant_and_per_vm_name() {
+    let h = harness().await;
+    let token = vm_token_of(&h, "lima").await;
+    created(&h, STAGE, &on("a", "lima")).await;
+    let mut theirs = on("a", "lima");
+    theirs["owner"] = json!("@luis:example.org");
+    created(&h, PROD, &theirs).await;
+    let mut cusco = on("c", "cusco");
+    cusco["owner"] = json!("@cy:example.org");
+    created(&h, STAGE, &cusco).await;
+    let (status, body) = vm_agents(&h, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    let agents = body["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1, "{body}");
+    assert_eq!(agents[0]["senders"], json!(["@ana:example.org"]));
 }
