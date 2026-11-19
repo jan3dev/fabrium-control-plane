@@ -1895,7 +1895,6 @@ async fn the_owner_route_needs_a_vm_of_the_tenant_with_a_row() {
 }
 
 #[tokio::test]
-#[ignore = "needs Task 4"]
 async fn a_project_delete_during_a_create_cannot_leave_a_dangling_vm() {
     let h = harness().await;
     h.fake.delay_launch(Duration::from_millis(30));

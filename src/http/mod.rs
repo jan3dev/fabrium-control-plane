@@ -44,7 +44,10 @@ pub fn router(state: AppState) -> Router {
                 .merge(delete(agents::delete)),
         )
         .route("/v1/projects", get(projects::list).post(projects::create))
-        .route("/v1/projects/{id}", put(projects::change))
+        .route(
+            "/v1/projects/{id}",
+            put(projects::change).delete(projects::delete),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_key,

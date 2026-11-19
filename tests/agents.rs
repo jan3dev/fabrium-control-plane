@@ -781,7 +781,6 @@ async fn a_missing_agent_with_an_unknown_project_is_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "needs Task 4"]
 async fn a_delete_of_a_project_cannot_leave_a_dangling_agent() {
     let h = harness().await;
     for n in 0..20 {

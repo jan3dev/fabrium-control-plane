@@ -9,12 +9,16 @@ use axum::{
 };
 use serde::Deserialize;
 
-use super::agents::{hex_id, name_in_use, parse};
+use super::{
+    agents::{hex_id, name_in_use, parse},
+    vms::visible,
+};
 use crate::{
     AppState,
     auth::Client,
     error::AppError,
     projects::{self, Project},
+    registry,
 };
 
 /// The body of both writes.
@@ -74,4 +78,54 @@ pub async fn change(
     let project = (projects::get(&state.db, tenant, &id).await?).ok_or(AppError::NotFound)?;
     tracing::info!(%tenant, project = %id, "project renamed");
     Ok(Json(project))
+}
+
+/// `DELETE /v1/projects/{id}`: deletes a project that no agent and no registry row of the
+/// tenant has, in one statement. A row of a VM that is gone does not count.
+pub async fn delete(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    id: Result<Path<String>, PathRejection>,
+) -> Result<StatusCode, AppError> {
+    let id = hex_id(id)?;
+    let tenant = &client.name;
+    // No create or recreate is between its check of the project and its registry insert.
+    let _guard = state.create_lock.lock().await;
+    if !projects::exists(&state.db, tenant, &id).await? {
+        return Err(AppError::NotFound);
+    }
+    drop_rows_of_gone_vms(&state, tenant, &id).await?;
+    if !projects::remove_if_free(&state.db, tenant, &id).await? {
+        return Err(AppError::Conflict("project in use".to_owned()));
+    }
+    tracing::info!(%tenant, project = %id, "project deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Drops the rows of the project that no VM backs: a VM terminated outside the control plane
+/// keeps its row for ever. Only rows older than 10 minutes, because EC2 lists a new VM late.
+/// A failed EC2 list drops nothing, and the delete goes on.
+async fn drop_rows_of_gone_vms(
+    state: &AppState,
+    tenant: &str,
+    project: &str,
+) -> Result<(), AppError> {
+    let old = registry::old_rows_of_project(&state.db, tenant, project).await?;
+    if old.is_empty() {
+        return Ok(());
+    }
+    let instances = match state.ec2.list(tenant).await {
+        Ok(instances) => instances,
+        Err(e) => {
+            let error = format!("{e:#}");
+            tracing::warn!(%tenant, %project, %error, "could not list the vms, so no row is dropped");
+            return Ok(());
+        }
+    };
+    let listed = |vm: &String| (instances.iter()).any(|i| i.id == *vm && visible(i, tenant));
+    for vm in old.iter().filter(|vm| !listed(vm)) {
+        registry::remove(&state.db, vm).await?;
+        tracing::info!(%tenant, %vm, "dropped the registry row of a vm that is gone");
+    }
+    Ok(())
 }

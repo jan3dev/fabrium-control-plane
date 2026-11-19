@@ -172,6 +172,22 @@ pub async fn vm_by_token(
         .transpose()
 }
 
+/// The `instance_id` of the rows of the project that are older than 10 minutes.
+pub async fn old_rows_of_project(
+    db: &DatabaseConnection,
+    tenant: &str,
+    project_id: &str,
+) -> Result<Vec<String>, DbErr> {
+    let sql = "SELECT instance_id FROM vms WHERE tenant = ? AND project_id = ?
+               AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes')";
+    let rows = db
+        .query_all_raw(stmt(sql, vec![tenant.into(), project_id.into()]))
+        .await?;
+    rows.iter()
+        .map(|row| row.try_get("", "instance_id"))
+        .collect()
+}
+
 /// Drops the row of a VM, so its token stops working.
 pub async fn remove(db: &DatabaseConnection, instance_id: &str) -> Result<(), DbErr> {
     let sql = "DELETE FROM vms WHERE instance_id = ?";

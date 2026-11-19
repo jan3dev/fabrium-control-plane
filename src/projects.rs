@@ -86,3 +86,18 @@ pub async fn rename(
     let done = db.execute_raw(stmt(sql, values)).await?;
     Ok(done.rows_affected() > 0)
 }
+
+/// One DELETE that applies only to a project that no agent and no registry row of the tenant
+/// has. `false`: no row deleted.
+pub async fn remove_if_free(
+    db: &DatabaseConnection,
+    tenant: &str,
+    id: &str,
+) -> Result<bool, DbErr> {
+    let sql = "DELETE FROM projects WHERE tenant = ? AND id = ?
+               AND NOT EXISTS (SELECT 1 FROM agents WHERE tenant = ? AND project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM vms WHERE tenant = ? AND project_id = projects.id)";
+    let values = vec![tenant.into(), id.into(), tenant.into(), tenant.into()];
+    let done = db.execute_raw(stmt(sql, values)).await?;
+    Ok(done.rows_affected() > 0)
+}

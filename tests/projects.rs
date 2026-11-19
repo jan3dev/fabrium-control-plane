@@ -231,6 +231,7 @@ async fn the_project_routes_need_the_tenant_key() {
         ("GET", "/v1/projects", Vec::new()),
         ("POST", "/v1/projects", body.clone()),
         ("PUT", uri.as_str(), body),
+        ("DELETE", uri.as_str(), Vec::new()),
     ];
     for (method, uri, body) in &routes {
         let sent = send_from(&h.app, method, uri, None, Some(STAGE_SOURCE), body.clone()).await;
@@ -241,4 +242,197 @@ async fn the_project_routes_need_the_tenant_key() {
         assert_eq!(sent.0, StatusCode::FORBIDDEN, "{method} {uri}");
     }
     assert_eq!(list_projects(&h, STAGE).await, json!([project]));
+}
+
+async fn delete(h: &Harness, auth: &str, id: &str) -> (StatusCode, Vec<u8>) {
+    call_raw(&h.app, "DELETE", &format!("/v1/projects/{id}"), Some(auth)).await
+}
+
+fn in_use() -> (StatusCode, Vec<u8>) {
+    let body = serde_json::to_vec(&error("project in use")).unwrap();
+    (StatusCode::CONFLICT, body)
+}
+
+fn deleted() -> (StatusCode, Vec<u8>) {
+    (StatusCode::NO_CONTENT, Vec::new())
+}
+
+fn id_of(value: &Value) -> &str {
+    value["id"].as_str().unwrap()
+}
+
+/// Creates an agent of `stage` in the project. Returns the agent.
+async fn agent_in(h: &Harness, project_id: &str) -> Value {
+    let body = json!({
+        "name": "reviewer", "owner": "@ana:example.org", "model": "glm-5-3",
+        "project_id": project_id,
+    });
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let (status, bytes) = send(&h.app, "POST", "/v1/agents", Some(STAGE), bytes).await;
+    assert_eq!(status, StatusCode::CREATED);
+    json_of(&bytes)
+}
+
+/// Creates the VM `lima` of `stage` in the project. Returns its id.
+async fn vm_in(h: &Harness, project_id: &str) -> String {
+    let mut body = create_body("lima");
+    body["project_id"] = json!(project_id);
+    let (status, vm) = create(&h.app, STAGE, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    id_of(&vm).to_owned()
+}
+
+/// Moves the registry row of a VM back to a day of the past.
+async fn backdate_row(h: &Harness, vm: &str) {
+    use sea_orm::ConnectionTrait;
+    let sql =
+        format!("UPDATE vms SET created_at = '2026-01-01T00:00:00Z' WHERE instance_id = '{vm}'");
+    h.state.db.execute_unprepared(&sql).await.unwrap();
+}
+
+/// Whether the VM has a registry row.
+async fn has_row(h: &Harness, vm: &str) -> bool {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let sql = "SELECT 1 FROM vms WHERE instance_id = ?";
+    let query = Statement::from_sql_and_values(DbBackend::Sqlite, sql, [vm.into()]);
+    h.state.db.query_one_raw(query).await.unwrap().is_some()
+}
+
+#[tokio::test]
+async fn an_unused_project_is_deleted() {
+    let h = harness().await;
+    let project = created(&h, STAGE, "Payments").await;
+    assert_eq!(delete(&h, STAGE, id_of(&project)).await, deleted());
+    assert_eq!(list_projects(&h, STAGE).await, json!([]));
+    let (status, body) = delete(&h, STAGE, id_of(&project)).await;
+    assert_eq!(
+        (status, json_of(&body)),
+        (StatusCode::NOT_FOUND, not_found())
+    );
+    // The name is free again.
+    created(&h, STAGE, "Payments").await;
+}
+
+#[tokio::test]
+async fn a_project_of_an_agent_is_in_use() {
+    let h = harness().await;
+    let project = created(&h, STAGE, "Payments").await;
+    let agent = agent_in(&h, id_of(&project)).await;
+    assert_eq!(delete(&h, STAGE, id_of(&project)).await, in_use());
+    assert_eq!(list_projects(&h, STAGE).await, json!([project]));
+    let uri = format!("/v1/agents/{}", id_of(&agent));
+    let (status, _) = call_raw(&h.app, "DELETE", &uri, Some(STAGE)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(delete(&h, STAGE, id_of(&project)).await, deleted());
+}
+
+#[tokio::test]
+async fn an_agent_that_leaves_the_project_frees_it() {
+    let h = harness().await;
+    let project = created(&h, STAGE, "Payments").await;
+    let agent = agent_in(&h, id_of(&project)).await;
+    let uri = format!("/v1/agents/{}", id_of(&agent));
+    let body = br#"{"project_id":""}"#.to_vec();
+    let (status, _) = send(&h.app, "PUT", &uri, Some(STAGE), body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(delete(&h, STAGE, id_of(&project)).await, deleted());
+}
+
+#[tokio::test]
+async fn an_agent_of_another_tenant_does_not_hold_the_project() {
+    let h = harness().await;
+    let project = created(&h, STAGE, "Payments").await;
+    // A row of another tenant with the id, as no write of the API can make it.
+    use sea_orm::ConnectionTrait;
+    let sql = format!(
+        "INSERT INTO agents (id, tenant, name, owner, model, project_id) VALUES \
+         ('{}', 'prod-sim', 'x', '@ana:example.org', 'glm-5-3', '{}')",
+        "0".repeat(32),
+        id_of(&project)
+    );
+    h.state.db.execute_unprepared(&sql).await.unwrap();
+    assert_eq!(delete(&h, STAGE, id_of(&project)).await, deleted());
+}
+
+#[tokio::test]
+async fn a_project_of_a_vm_row_is_in_use() {
+    let h = harness().await;
+    let project = created(&h, STAGE, "Payments").await;
+    let vm = vm_in(&h, id_of(&project)).await;
+    assert_eq!(delete(&h, STAGE, id_of(&project)).await, in_use());
+    let uri = format!("/v1/vms/{vm}/owner");
+    let body = br#"{"project_id":""}"#.to_vec();
+    let (status, _) = send(&h.app, "PUT", &uri, Some(STAGE), body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(delete(&h, STAGE, id_of(&project)).await, deleted());
+}
+
+#[tokio::test]
+async fn a_delete_of_another_tenant_is_not_found_and_changes_nothing() {
+    let h = harness().await;
+    let project = created(&h, STAGE, "Payments").await;
+    let upper = "A".repeat(32);
+    for (auth, id) in [
+        (PROD, id_of(&project)),
+        (STAGE, "abc"),
+        (STAGE, "%FF"),
+        (STAGE, upper.as_str()),
+        (STAGE, &"0".repeat(32)),
+    ] {
+        let (status, body) = delete(&h, auth, id).await;
+        assert_eq!(
+            (status, json_of(&body)),
+            (StatusCode::NOT_FOUND, not_found()),
+            "{id}"
+        );
+    }
+    assert_eq!(list_projects(&h, STAGE).await, json!([project]));
+}
+
+#[tokio::test]
+async fn a_row_of_a_vm_that_ec2_no_longer_lists_does_not_keep_the_project() {
+    let h = harness().await;
+    let project = created(&h, STAGE, "Payments").await;
+    let vm = vm_in(&h, id_of(&project)).await;
+    // The VM died outside the control plane, long ago.
+    h.fake.set_state(&vm, "terminated");
+    backdate_row(&h, &vm).await;
+    assert_eq!(delete(&h, STAGE, id_of(&project)).await, deleted());
+    assert!(!has_row(&h, &vm).await);
+}
+
+#[tokio::test]
+async fn a_new_row_that_ec2_does_not_list_yet_still_counts() {
+    let h = harness().await;
+    let project = created(&h, STAGE, "Payments").await;
+    let vm = vm_in(&h, id_of(&project)).await;
+    h.fake.hide_launches(true);
+    assert_eq!(delete(&h, STAGE, id_of(&project)).await, in_use());
+    assert!(has_row(&h, &vm).await);
+}
+
+#[tokio::test]
+async fn a_row_of_a_listed_vm_still_counts_when_it_is_old() {
+    let h = harness().await;
+    let project = created(&h, STAGE, "Payments").await;
+    let vm = vm_in(&h, id_of(&project)).await;
+    h.fake.set_state(&vm, "running");
+    backdate_row(&h, &vm).await;
+    assert_eq!(delete(&h, STAGE, id_of(&project)).await, in_use());
+    assert!(has_row(&h, &vm).await);
+}
+
+#[tokio::test]
+async fn a_failing_ec2_list_does_not_fail_the_delete() {
+    let h = harness().await;
+    let empty = created(&h, STAGE, "Empty").await;
+    let project = created(&h, STAGE, "Payments").await;
+    let vm = vm_in(&h, id_of(&project)).await;
+    h.fake.set_state(&vm, "terminated");
+    backdate_row(&h, &vm).await;
+    h.fake.fail(true);
+    assert_eq!(delete(&h, STAGE, id_of(&empty)).await, deleted());
+    // Without the list, a row that looks stale still counts.
+    assert_eq!(delete(&h, STAGE, id_of(&project)).await, in_use());
+    assert!(has_row(&h, &vm).await);
 }
