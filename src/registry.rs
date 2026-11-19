@@ -48,10 +48,14 @@ fn record(row: &QueryResult) -> Result<Record, DbErr> {
     })
 }
 
-pub async fn insert(db: &DatabaseConnection, vm: &NewVm<'_>) -> Result<(), DbErr> {
+/// One INSERT. It stores `project_id` only while that is a project of the tenant: a project
+/// deleted during the launch gives NULL, a personal VM. Returns the stored `project_id`.
+pub async fn insert(db: &DatabaseConnection, vm: &NewVm<'_>) -> Result<Option<String>, DbErr> {
     let sql = "INSERT INTO vms
                  (instance_id, tenant, name, creator, auto_stop_hours, token_hash, project_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?)";
+               VALUES (?, ?, ?, ?, ?, ?,
+                       (SELECT id FROM projects WHERE id = ? AND tenant = ?))
+               RETURNING project_id";
     let values = vec![
         vm.instance_id.into(),
         vm.tenant.into(),
@@ -60,8 +64,11 @@ pub async fn insert(db: &DatabaseConnection, vm: &NewVm<'_>) -> Result<(), DbErr
         i64::from(vm.auto_stop_hours).into(),
         token_hash(vm.token).into(),
         vm.project_id.map(str::to_owned).into(),
+        vm.tenant.into(),
     ];
-    db.execute_raw(stmt(sql, values)).await.map(|_| ())
+    let row = db.query_one_raw(stmt(sql, values)).await?;
+    let row = row.ok_or_else(|| DbErr::Custom(format!("vm {} not stored", vm.instance_id)))?;
+    row.try_get("", "project_id")
 }
 
 /// The rows of a tenant, by instance id.

@@ -693,7 +693,8 @@ async fn the_text_project_of_phase_1_is_still_stored_and_returned() {
 async fn an_unknown_project_id_is_refused_on_create_and_change() {
     let h = harness().await;
     let zeros = "0".repeat(32);
-    for id in [zeros.as_str(), "nope"] {
+    // `""` in a POST is not a project either: only a PUT reads it as "clear".
+    for id in [zeros.as_str(), "nope", ""] {
         let body = with("reviewer", |b| b["project_id"] = json!(id));
         assert_eq!(post(&h, STAGE, &body).await, unknown_project(), "{id}");
     }

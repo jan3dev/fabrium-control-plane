@@ -333,8 +333,7 @@ pub async fn create(
     let task = tokio::spawn(
         async move {
             name_free(&state, &tenant, &spec.name).await?;
-            // Under the lock, which a project delete takes too: the project stays until the
-            // registry row that holds it is in.
+            // A project deleted during the launch leaves the VM personal (`registry::insert`).
             if let Some(project) = &spec.project_id
                 && !projects::exists(&state.db, &tenant, project).await?
             {
@@ -379,8 +378,7 @@ struct LaunchSpec {
 }
 
 /// The part of a create that must not be cut in two: the launch and the insert of the
-/// payload. It holds the create lock until the registry row is in, so a project delete sees
-/// the row. It checks no name and no project.
+/// payload. It holds the create lock until the payload is in the store. It checks no name.
 async fn launch_vm(
     state: &AppState,
     tenant: &str,
@@ -417,6 +415,7 @@ async fn launch_vm(
     // No await between the launch and the insert: the VM cannot redeem before the entry exists.
     let name = &instance.name;
     (state.bootstrap).insert(&token, payload, &instance.id, tenant, name);
+    drop(guard);
     tracing::info!(%tenant, vm = %instance.id, %instance_type, "vm launched");
     let new = NewVm {
         instance_id: &instance.id,
@@ -429,17 +428,16 @@ async fn launch_vm(
     };
     // The VM runs already. Without a row it keeps the hours of its tag, so only log.
     let record = match registry::insert(&state.db, &new).await {
-        Ok(()) => Some(Record {
+        Ok(project_id) => Some(Record {
             creator: spec.creator,
             auto_stop_hours,
-            project_id: spec.project_id,
+            project_id,
         }),
         Err(e) => {
             tracing::error!(vm = %instance.id, error = %e, "could not register the vm");
             None
         }
     };
-    drop(guard);
     Ok(Vm::new(&instance, &state.bootstrap, record.as_ref()))
 }
 

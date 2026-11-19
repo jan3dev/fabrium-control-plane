@@ -193,7 +193,7 @@ An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and 
 | `instance_type` | Optional. In `INSTANCE_TYPES`. The default is `DEFAULT_INSTANCE_TYPE`. |
 | `auto_stop_hours` | Optional integer from 1 to 168. The default is 12. |
 | `creator` | Optional. A Matrix user id: `@localpart:server`, printable ASCII without spaces, at most 255 bytes. |
-| `project_id` | Optional. The `id` of a project of the tenant, else `400 {"error":"unknown project"}` before any launch. |
+| `project_id` | Optional. The `id` of a project of the tenant, else `400 {"error":"unknown project"}` before any launch. A project deleted during the launch leaves the new VM personal: its registry row gets `project_id` `null`. |
 | `files[].path` | Starts with `/` and does not end with `/`. No `..` segment. No control character, such as a newline or a NUL byte. |
 | `files[].mode` | `^[0-7]{3,4}$` |
 | `files[].owner` | `^[a-z_][a-z0-9_-]{0,31}$` |
@@ -202,19 +202,19 @@ An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and 
 
 A body larger than 256 KiB gives `413`. If a VM of the same tenant that is not terminated has the name, the result is `409 {"error":"name in use"}`. A VM of another tenant, or a terminated VM, does not count. A VM that still waits for its token also holds its name, even if EC2 does not list it yet. A VM that you delete keeps its name until EC2 reports it as `terminated`, usually after about a minute, so a create with the same name right after a delete can give `409`.
 
-Creates run one at a time: one lock, held from the name check to the insert of the registry row (about 3 s), stops two requests with one name from both passing the name check, and keeps a project from being deleted between its check and the row that holds it. A create also runs in a task of its own, so the 10 s request timeout cannot separate the launch from the insert of the payload: a VM that EC2 accepted always has its payload, and never holds its name without one. The task keeps the lock until the registry row is in, and the SDK timeouts bound that time. To run creates in parallel, use a lock per tenant and name. With more than one control plane instance, the lock must be shared.
+Creates run one at a time: one lock, held from the name check to the insert of the payload (about 3 s), stops two requests with one name from both passing the name check. A create also runs in a task of its own, so the 10 s request timeout cannot separate the launch from the insert of the payload: a VM that EC2 accepted always has its payload, and never holds its name without one. The task keeps the lock until the payload is in the store, and the SDK timeouts bound that time. To run creates in parallel, use a lock per tenant and name. With more than one control plane instance, the lock must be shared.
 
 ### Replace a VM
 
 `POST /v1/vms/{id}/recreate` with `{"bootstrap": {...}}` terminates the VM and launches a new one in its place. It gives a VM new credentials. The files of the old VM are lost. It works in any state that the list shows, as a delete does.
 
-- What stays: the name, the instance type, and the creator, the project, and the auto-stop hours of the registry row (see [Auto-stop](#auto-stop)). The agents of the name stay too (see [Agents](#agents)).
+- What stays: the name, the instance type, and the creator, the project, and the auto-stop hours of the registry row (see [Auto-stop](#auto-stop)). A project deleted during the launch leaves the new VM personal, as in a create. The agents of the name stay too (see [Agents](#agents)).
 - What is new: the instance id, the payload of the body, the bootstrap token, and the VM token. The VM token of the old VM stops working.
 - The payload has the rules of a create, and a body larger than 256 KiB gives `413`. The service does not check the name, because the old VM holds it until EC2 reports it as `terminated`. It does not check the instance type against `INSTANCE_TYPES` either, because the list can change after the create.
 - A VM without a registry row gives `409 {"error":"vm has no registry row"}`, and nothing changes. Delete it and create it again.
 - If the launch fails after the terminate, the answer is `502`. The old VM is gone, with its registry row. Its agents keep their records. Once EC2 reports the old VM as `terminated`, a create with the same name brings the VM back.
 
-A replace holds the lock of the creates from the read of the registry row to the insert of the new row, so two replaces of one VM launch one VM: the second gets the `409`. A delete holds the same lock from the terminate to the drop of the row, so a replace that comes after a delete of the same VM gets the `409` too, and a delete that comes after a replace terminates the old VM and keeps the new one. A replace runs in a task of its own, as a create does.
+A replace holds the lock of the creates from the read of the registry row to the insert of the new payload, so two replaces of one VM launch one VM: the second gets the `409`. A delete holds the same lock from the terminate to the drop of the row, so a replace that comes after a delete of the same VM gets the `409` too, and a delete that comes after a replace terminates the old VM and keeps the new one. A replace runs in a task of its own, as a create does.
 
 ### Owner of a VM
 
@@ -304,7 +304,7 @@ A project is a named group of agents and VMs of a tenant. An agent or a VM with 
 The rules of each field and every error are in section 1 of [the projects contracts](docs/superpowers/plans/2026-11-19-agents-projects-contracts.md).
 
 - A name is 1 to 64 characters, without control characters or white space at either end, and unique in the tenant when the case of ASCII letters is ignored. A rename that changes only the case is allowed.
-- `DELETE /v1/projects/{id}` gives `409 {"error":"project in use"}` while an agent or a registry row of a VM of the tenant has the project. The check and the delete are one statement.
+- `DELETE /v1/projects/{id}` gives `409 {"error":"project in use"}` while an agent or a registry row of a VM of the tenant has the project. The check and the delete are one statement. A delete does not wait for a create or a replace: the VM of a launch that is still running when the project goes gets `project_id` `null`.
 - A VM that was terminated outside the control plane keeps its registry row. So before the delete, the service drops the rows of the project that are older than 10 minutes and whose VM EC2 no longer lists. A newer row still counts, because EC2 lists a new VM late. If the EC2 list fails, nothing is dropped and the delete goes on.
 - A project of another tenant, and an `{id}` that is not 32 lowercase hex characters, give `404 {"error":"not found"}`.
 - The service checks the data only. It does not check who the caller is: zooid does.

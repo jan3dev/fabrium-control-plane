@@ -89,8 +89,6 @@ pub async fn delete(
 ) -> Result<StatusCode, AppError> {
     let id = hex_id(id)?;
     let tenant = &client.name;
-    // No create or recreate is between its check of the project and its registry insert.
-    let _guard = state.create_lock.lock().await;
     if !projects::exists(&state.db, tenant, &id).await? {
         return Err(AppError::NotFound);
     }
