@@ -1,6 +1,7 @@
 mod agents;
 mod health;
 mod ping;
+mod projects;
 mod redeem;
 mod vms;
 
@@ -41,6 +42,8 @@ pub fn router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(agents::MAX_BODY))
                 .merge(delete(agents::delete)),
         )
+        .route("/v1/projects", get(projects::list).post(projects::create))
+        .route("/v1/projects/{id}", put(projects::change))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_key,
