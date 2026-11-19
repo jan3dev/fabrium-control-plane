@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod auth;
 pub mod bootstrap;
 pub mod config;
@@ -40,7 +41,9 @@ pub struct AppState {
     pub bootstrap: Arc<bootstrap::Store>,
     /// vCPUs and memory of the allowed instance types, cached after the first success.
     pub types: Arc<OnceCell<Vec<ec2::TypeSpec>>>,
-    /// Held by `POST /v1/vms` from the name check to the launch.
+    /// Held by `POST /v1/vms` from the name check to the launch, by a recreate from the read
+    /// of the registry row to the launch, and by a delete from the terminate to the drop of
+    /// the row.
     pub create_lock: Arc<Mutex<()>>,
 }
 

@@ -109,6 +109,20 @@ pub async fn hours_by_token(db: &DatabaseConnection, token: &str) -> Result<Opti
     row.as_ref().map(hours).transpose()
 }
 
+/// The tenant and the name of the VM that holds `token`.
+pub async fn vm_by_token(
+    db: &DatabaseConnection,
+    token: &str,
+) -> Result<Option<(String, String)>, DbErr> {
+    let sql = "SELECT tenant, name FROM vms WHERE token_hash = ?";
+    let row = db
+        .query_one_raw(stmt(sql, vec![token_hash(token).into()]))
+        .await?;
+    (row.as_ref())
+        .map(|row| Ok((row.try_get("", "tenant")?, row.try_get("", "name")?)))
+        .transpose()
+}
+
 /// Drops the row of a VM, so its token stops working.
 pub async fn remove(db: &DatabaseConnection, instance_id: &str) -> Result<(), DbErr> {
     let sql = "DELETE FROM vms WHERE instance_id = ?";

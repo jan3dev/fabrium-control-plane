@@ -124,7 +124,7 @@ fn valid_id(id: &str) -> bool {
 
 /// An id that does not decode, such as `%FF`, is a bad id like any other: a `404`, not the
 /// plain-text `400` of the extractor.
-fn id_of(id: Result<Path<String>, PathRejection>) -> Result<String, AppError> {
+pub(crate) fn id_of(id: Result<Path<String>, PathRejection>) -> Result<String, AppError> {
     id.map(|Path(id)| id).map_err(|_| AppError::NotFound)
 }
 
@@ -237,10 +237,12 @@ pub async fn delete(
 ) -> Result<StatusCode, AppError> {
     let id = id_of(id)?;
     let vm = find(&state, &client.name, &id).await?;
+    // Under the create lock, a recreate of this VM sees the row before the terminate or not at all.
+    let _guard = state.create_lock.lock().await;
     state.ec2.act(&vm.id, Action::Terminate).await?;
     // The VM is gone, so nobody can redeem its payload. A failed terminate keeps the entry.
     state.bootstrap.remove_instance(&vm.id);
-    // The VM is terminated already: a failed delete only leaves a token that reads hours.
+    // The VM is gone: a failed drop only leaves a token that reads hours and agents.
     if let Err(e) = registry::remove(&state.db, &vm.id).await {
         tracing::error!(vm = %vm.id, error = %e, "could not drop the registry row");
     }
@@ -259,7 +261,7 @@ struct CreateVm {
 }
 
 /// `@localpart:server` in printable ASCII, at most 255 bytes (the Matrix limit).
-fn valid_creator(id: &str) -> bool {
+pub(crate) fn valid_creator(id: &str) -> bool {
     id.len() <= 255
         && id.bytes().all(|b| b.is_ascii_graphic())
         && (id.strip_prefix('@'))
@@ -267,8 +269,8 @@ fn valid_creator(id: &str) -> bool {
             .is_some_and(|(local, server)| !local.is_empty() && !server.is_empty())
 }
 
-/// `^[a-z0-9][a-z0-9-]{0,62}$`
-fn valid_name(name: &str) -> bool {
+/// `^[a-z0-9][a-z0-9-]{0,62}$`. The `vm` of an agent has the same rule.
+pub(crate) fn valid_name(name: &str) -> bool {
     let b = name.as_bytes();
     (1..=63).contains(&b.len())
         && b[0] != b'-'
@@ -309,13 +311,19 @@ pub async fn create(
     let guard = state.create_lock.clone().lock_owned().await;
     let tenant = client.name.clone();
     let instance_type = instance_type.to_owned();
+    let spec = LaunchSpec {
+        name: request.name,
+        creator: request.creator,
+        bootstrap: request.bootstrap,
+    };
     // A task of its own: the 10 s request timeout must not split the launch from the payload.
     let task = tokio::spawn(
         async move {
+            name_free(&state, &tenant, &spec.name).await?;
             launch_vm(
                 &state,
                 &tenant,
-                request,
+                spec,
                 &instance_type,
                 auto_stop_hours,
                 guard,
@@ -330,28 +338,39 @@ pub async fn create(
     Ok((StatusCode::CREATED, Json(vm)))
 }
 
-/// The part of a create that must not be cut in two: the name check, the launch, and the
-/// insert of the payload. It holds the create lock until the payload is in the store.
+/// A `409` if a VM of the tenant has the name. Run it under the create lock.
+async fn name_free(state: &AppState, tenant: &str, name: &str) -> Result<(), AppError> {
+    // EC2 lists a new VM late, so a name that the payload store holds counts as in use too.
+    let listed = (state.ec2.list(tenant).await?)
+        .iter()
+        .any(|i| visible(i, tenant) && i.name == name);
+    if listed || state.bootstrap.name_in_use(tenant, name) {
+        return Err(AppError::Conflict("name in use".to_owned()));
+    }
+    Ok(())
+}
+
+/// What `launch_vm` launches.
+struct LaunchSpec {
+    name: String,
+    creator: Option<String>,
+    bootstrap: Payload,
+}
+
+/// The part of a create that must not be cut in two: the launch and the insert of the
+/// payload. It holds the create lock until the payload is in the store. It checks no name.
 async fn launch_vm(
     state: &AppState,
     tenant: &str,
-    request: CreateVm,
+    spec: LaunchSpec,
     instance_type: &str,
     auto_stop_hours: u32,
     guard: OwnedMutexGuard<()>,
 ) -> Result<Vm, AppError> {
-    // EC2 lists a new VM late, so a name that the payload store holds counts as in use too.
-    let listed = (state.ec2.list(tenant).await?)
-        .iter()
-        .any(|i| visible(i, tenant) && i.name == request.name);
-    if listed || state.bootstrap.name_in_use(tenant, &request.name) {
-        return Err(AppError::Conflict("name in use".to_owned()));
-    }
-
     let token = bootstrap::new_token();
     // The VM reads its auto-stop hours with this token. Root-only: the agent runs as ubuntu.
     let vm_token = bootstrap::new_token();
-    let mut payload = request.bootstrap;
+    let mut payload = spec.bootstrap;
     let file = |path: &str, mode: &str, content: &str| File {
         path: path.to_owned(),
         mode: mode.to_owned(),
@@ -366,7 +385,7 @@ async fn launch_vm(
         .files
         .push(file("/etc/fabrium/control-plane-url", "644", url));
     let launch = Launch {
-        name: request.name,
+        name: spec.name,
         tenant: tenant.to_owned(),
         instance_type: instance_type.to_owned(),
         auto_stop_hours,
@@ -382,14 +401,14 @@ async fn launch_vm(
         instance_id: &instance.id,
         tenant,
         name,
-        creator: request.creator.as_deref(),
+        creator: spec.creator.as_deref(),
         auto_stop_hours,
         token: &vm_token,
     };
     // The VM runs already. Without a row it keeps the hours of its tag, so only log.
     let record = match registry::insert(&state.db, &new).await {
         Ok(()) => Some(Record {
-            creator: request.creator,
+            creator: spec.creator,
             auto_stop_hours,
         }),
         Err(e) => {
@@ -398,4 +417,58 @@ async fn launch_vm(
         }
     };
     Ok(Vm::new(&instance, &state.bootstrap, record.as_ref()))
+}
+
+#[derive(Deserialize)]
+struct RecreateVm {
+    bootstrap: Payload,
+}
+
+/// `POST /v1/vms/{id}/recreate`: terminates the VM and launches one with the same name, type,
+/// creator, and hours, with the new payload and a new VM token. It checks no name: the old VM
+/// holds it until EC2 reports it as terminated.
+pub async fn recreate(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    id: Result<Path<String>, PathRejection>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Vm>), AppError> {
+    let id = id_of(id)?;
+    let old = find(&state, &client.name, &id).await?;
+    let request: RecreateVm = serde_json::from_slice(&body)
+        .map_err(|_| AppError::BadRequest("invalid request body".to_owned()))?;
+    request
+        .bootstrap
+        .validate()
+        .map_err(|e| AppError::BadRequest(e.to_owned()))?;
+    // Read under the lock: of two recreates of one VM, the second finds no row and gets 409.
+    let guard = state.create_lock.clone().lock_owned().await;
+    let record = (registry::get(&state.db, &client.name, &old.id).await?)
+        .ok_or_else(|| AppError::Conflict("vm has no registry row".to_owned()))?;
+    let tenant = client.name.clone();
+    // A task of its own, as in `create`: the request timeout must not cut it after the terminate.
+    let task = tokio::spawn(
+        async move {
+            state.ec2.act(&old.id, Action::Terminate).await?;
+            state.bootstrap.remove_instance(&old.id);
+            // The VM is gone: a failed drop only leaves a token that reads hours and agents.
+            if let Err(e) = registry::remove(&state.db, &old.id).await {
+                tracing::error!(vm = %old.id, error = %e, "could not drop the registry row");
+            }
+            let spec = LaunchSpec {
+                name: old.name.clone(),
+                creator: record.creator,
+                bootstrap: request.bootstrap,
+            };
+            let hours = record.auto_stop_hours;
+            let vm = launch_vm(&state, &tenant, spec, &old.instance_type, hours, guard).await?;
+            tracing::info!(%tenant, old = %old.id, new = %vm.id, "vm recreated");
+            Ok::<_, AppError>(vm)
+        }
+        .in_current_span(),
+    );
+    let vm = task
+        .await
+        .map_err(|e| AppError::Aws(format!("recreate task failed: {e}")))??;
+    Ok((StatusCode::CREATED, Json(vm)))
 }

@@ -122,6 +122,7 @@ async fn every_tenant_route_checks_the_key_and_the_source() {
     h.fake.seed(stage_vm(ID, "lima", "running", "t3a.medium"));
     let create = serde_json::to_vec(&create_body("new")).unwrap();
     let auto_stop = br#"{"auto_stop_hours":8}"#.to_vec();
+    let recreate = serde_json::to_vec(&recreate_body(json!(empty_payload()))).unwrap();
     let routes = [
         ("GET", "/v1/ping".to_owned(), Vec::new()),
         ("GET", "/v1/instance-types".to_owned(), Vec::new()),
@@ -132,6 +133,7 @@ async fn every_tenant_route_checks_the_key_and_the_source() {
         ("POST", format!("/v1/vms/{ID}/stop"), Vec::new()),
         ("POST", format!("/v1/vms/{ID}/reboot"), Vec::new()),
         ("PUT", format!("/v1/vms/{ID}/auto-stop"), auto_stop),
+        ("POST", format!("/v1/vms/{ID}/recreate"), recreate),
     ];
     for (method, uri, body) in &routes {
         // A missing or bad key is a 401, from any address.
@@ -1319,4 +1321,317 @@ async fn list_shows_auto_stop_hours_or_null() {
     let (_, listed) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
     assert_eq!(listed[0]["auto_stop_hours"], 8);
     assert_eq!(listed[1]["auto_stop_hours"], Value::Null);
+}
+
+fn recreate_body(bootstrap: Value) -> Value {
+    json!({ "bootstrap": bootstrap })
+}
+
+async fn recreate(h: &Harness, auth: &str, id: &str, body: &Value) -> (StatusCode, Value) {
+    let uri = format!("/v1/vms/{id}/recreate");
+    let bytes = serde_json::to_vec(body).unwrap();
+    let (status, bytes) = send(&h.app, "POST", &uri, Some(auth), bytes).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Creates `lima` as `stage`, with the type `t3a.large`, 5 hours, and a creator. Returns its id.
+async fn lima(h: &Harness) -> String {
+    let body = with(|b| {
+        b["instance_type"] = json!("t3a.large");
+        b["auto_stop_hours"] = json!(5);
+        b["creator"] = json!("@luis:example.org");
+    });
+    let (status, vm) = create(&h.app, STAGE, &body).await;
+    assert_eq!(status, StatusCode::CREATED);
+    vm["id"].as_str().unwrap().to_owned()
+}
+
+/// The payload that the VM of launch `n` redeems.
+async fn payload_of_launch(h: &Harness, n: usize) -> Value {
+    let token = token_in(&h.fake.launches()[n].user_data);
+    let (status, payload) = redeem(h, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    payload
+}
+
+fn vm_token_in(payload: &Value) -> String {
+    let files = payload["files"].as_array().unwrap();
+    let file = files.iter().find(|f| f["path"] == "/etc/fabrium/vm-token");
+    file.expect("the VM token file")["content"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// A VM route read with a VM token.
+async fn with_vm_token(h: &Harness, uri: &str, token: &str) -> (StatusCode, Value) {
+    call(&h.app, "GET", uri, Some(&format!("Bearer {token}"))).await
+}
+
+/// The VM of the list with this id.
+fn listed_vm(listed: &Value, id: &Value) -> Value {
+    let vms = listed.as_array().unwrap();
+    vms.iter()
+        .find(|vm| vm["id"] == *id)
+        .expect("the VM is listed")
+        .clone()
+}
+
+#[tokio::test]
+async fn recreate_replaces_the_vm_and_keeps_its_name_type_hours_and_creator() {
+    let h = harness().await;
+    let old = lima(&h).await;
+    let body = recreate_body(json!(empty_payload()));
+    let (status, vm) = recreate(&h, STAGE, &old, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    assert_ne!(vm["id"], old.as_str());
+    let kept = (
+        &vm["name"],
+        &vm["instance_type"],
+        &vm["state"],
+        &vm["setup"],
+    );
+    assert_eq!(
+        kept,
+        (
+            &json!("lima"),
+            &json!("t3a.large"),
+            &json!("pending"),
+            &json!("pending")
+        )
+    );
+    assert_eq!(h.fake.actions(), [(old.clone(), Action::Terminate)]);
+    let launches = h.fake.launches();
+    assert_eq!(launches.len(), 2);
+    for l in &launches {
+        assert_eq!(
+            (l.name.as_str(), l.instance_type.as_str(), l.auto_stop_hours),
+            ("lima", "t3a.large", 5)
+        );
+    }
+    let (_, listed) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
+    let new = listed_vm(&listed, &vm["id"]);
+    let registry = (&new["creator"], &new["auto_stop_hours"], &new["registered"]);
+    assert_eq!(
+        registry,
+        (&json!("@luis:example.org"), &json!(5), &json!(true))
+    );
+    // The old VM shuts down, and it has no registry row any more.
+    let gone = listed_vm(&listed, &json!(old));
+    assert_eq!(
+        (&gone["state"], &gone["registered"]),
+        (&json!("shutting-down"), &json!(false))
+    );
+}
+
+#[tokio::test]
+async fn recreate_delivers_the_new_payload_and_a_new_vm_token() {
+    let h = harness().await;
+    let old = lima(&h).await;
+    let old_token = vm_token_in(&payload_of_launch(&h, 0).await);
+    let bootstrap = json!({
+        "files": [{ "path": "/home/ubuntu/zooid/.env", "mode": "600", "owner": "ubuntu", "content": "new" }],
+        "script": "true"
+    });
+    let (status, _) = recreate(&h, STAGE, &old, &recreate_body(bootstrap.clone())).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let payload = payload_of_launch(&h, 1).await;
+    assert_eq!(sent_part(&payload), bootstrap);
+    let new_token = vm_token_in(&payload);
+    assert_ne!(new_token, old_token);
+    let not_found = (StatusCode::NOT_FOUND, not_found());
+    assert_eq!(
+        with_vm_token(&h, "/v1/vm/auto-stop", &old_token).await,
+        not_found
+    );
+    assert_eq!(
+        with_vm_token(&h, "/v1/vm/auto-stop", &new_token).await,
+        (StatusCode::OK, json!({ "auto_stop_hours": 5 }))
+    );
+}
+
+/// Creates the agent `reviewer` on `lima` as `stage`.
+async fn agent_on_lima(h: &Harness) -> Value {
+    let body = json!({
+        "name": "reviewer", "owner": "@ana:example.org", "model": "glm-5-3",
+        "vm": "lima", "rooms": ["#general:example.org"]
+    });
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let (status, bytes) = send(&h.app, "POST", "/v1/agents", Some(STAGE), bytes).await;
+    assert_eq!(status, StatusCode::CREATED);
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn recreate_keeps_the_agents_of_the_vm() {
+    let h = harness().await;
+    let old = lima(&h).await;
+    let old_token = vm_token_in(&payload_of_launch(&h, 0).await);
+    agent_on_lima(&h).await;
+    let body = recreate_body(json!(empty_payload()));
+    assert_eq!(
+        recreate(&h, STAGE, &old, &body).await.0,
+        StatusCode::CREATED
+    );
+    let new_token = vm_token_in(&payload_of_launch(&h, 1).await);
+    let (status, agents) = with_vm_token(&h, "/v1/vm/agents", &new_token).await;
+    assert_eq!(
+        (status, &agents["agents"][0]["name"]),
+        (StatusCode::OK, &json!("reviewer"))
+    );
+    // The token of the replaced VM reads nothing.
+    let not_found = (StatusCode::NOT_FOUND, not_found());
+    assert_eq!(
+        with_vm_token(&h, "/v1/vm/agents", &old_token).await,
+        not_found
+    );
+}
+
+#[tokio::test]
+async fn recreate_of_the_vm_of_another_tenant_is_not_found() {
+    let h = harness().await;
+    let old = lima(&h).await;
+    let body = recreate_body(json!(empty_payload()));
+    assert_eq!(
+        recreate(&h, PROD, &old, &body).await,
+        (StatusCode::NOT_FOUND, not_found())
+    );
+    assert!(h.fake.actions().is_empty());
+    assert_eq!(h.fake.launches().len(), 1);
+}
+
+#[tokio::test]
+async fn recreate_refuses_a_bad_payload_before_it_terminates() {
+    let h = harness().await;
+    let old = lima(&h).await;
+    let mut relative = json!(empty_payload());
+    relative["files"] =
+        json!([{ "path": "relative", "mode": "600", "owner": "ubuntu", "content": "" }]);
+    let (status, body) = recreate(&h, STAGE, &old, &recreate_body(relative)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body,
+        json!({ "error": "file path must start with / and have no .. segment" })
+    );
+    let (status, body) = recreate(&h, STAGE, &old, &json!({ "files": [] })).await;
+    assert_eq!(
+        (status, body),
+        (
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "invalid request body" })
+        )
+    );
+    assert!(h.fake.actions().is_empty());
+    assert_eq!(h.fake.launches().len(), 1);
+}
+
+#[tokio::test]
+async fn recreate_without_a_registry_row_is_a_conflict() {
+    let h = harness().await;
+    let id = "i-00000000aa";
+    h.fake.seed(stage_vm(id, "old", "running", "t3a.medium"));
+    let body = recreate_body(json!(empty_payload()));
+    assert_eq!(
+        recreate(&h, STAGE, id, &body).await,
+        (
+            StatusCode::CONFLICT,
+            json!({ "error": "vm has no registry row" })
+        )
+    );
+    assert!(h.fake.actions().is_empty());
+    assert!(h.fake.launches().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_launch_of_recreate_leaves_no_vm() {
+    let h = harness().await;
+    let old = lima(&h).await;
+    let old_token = vm_token_in(&payload_of_launch(&h, 0).await);
+    let agent = agent_on_lima(&h).await;
+    h.fake.fail_launch(true);
+    let body = recreate_body(json!(empty_payload()));
+    assert_eq!(
+        recreate(&h, STAGE, &old, &body).await,
+        (StatusCode::BAD_GATEWAY, aws_failed())
+    );
+    // The old VM is gone, and no VM took its place.
+    let (_, listed) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
+    let live = (listed.as_array().unwrap().iter())
+        .filter(|vm| vm["name"] == "lima" && vm["state"] != "shutting-down")
+        .count();
+    assert_eq!(live, 0, "{listed}");
+    // Its registry row is gone with it, and its agents stay.
+    let not_found = (StatusCode::NOT_FOUND, not_found());
+    assert_eq!(
+        with_vm_token(&h, "/v1/vm/auto-stop", &old_token).await,
+        not_found
+    );
+    assert_eq!(
+        call(&h.app, "GET", "/v1/agents", Some(STAGE)).await,
+        (StatusCode::OK, json!([agent]))
+    );
+    // Once EC2 reports the old VM as terminated, a create brings the name back.
+    h.fake.fail_launch(false);
+    h.fake.set_state(&old, "terminated");
+    assert_eq!(
+        create(&h.app, STAGE, &create_body("lima")).await.0,
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn create_still_refuses_a_name_in_use() {
+    let h = harness().await;
+    let old = lima(&h).await;
+    let body = recreate_body(json!(empty_payload()));
+    assert_eq!(
+        recreate(&h, STAGE, &old, &body).await.0,
+        StatusCode::CREATED
+    );
+    // The new VM and the old one, which shuts down, both hold the name.
+    let (status, body) = create(&h.app, STAGE, &create_body("lima")).await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::CONFLICT, json!({ "error": "name in use" }))
+    );
+    assert_eq!(h.fake.launches().len(), 2);
+}
+
+#[tokio::test]
+async fn concurrent_recreates_of_one_vm_launch_once() {
+    let h = harness().await;
+    let old = lima(&h).await;
+    let bytes = serde_json::to_vec(&recreate_body(json!(empty_payload()))).unwrap();
+    // A create holds the lock while both requests arrive, so both get as far as they can.
+    let lock = h.state.create_lock.clone().lock_owned().await;
+    let send_one = || {
+        let (app, bytes) = (h.app.clone(), bytes.clone());
+        let uri = format!("/v1/vms/{old}/recreate");
+        tokio::spawn(async move { send(&app, "POST", &uri, Some(STAGE), bytes).await.0 })
+    };
+    let (one, two) = (send_one(), send_one());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(lock);
+    let mut statuses = [one.await.unwrap(), two.await.unwrap()];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::CREATED, StatusCode::CONFLICT]);
+    assert_eq!(h.fake.launches().len(), 2);
+}
+
+#[tokio::test]
+async fn delete_waits_for_the_create_lock() {
+    let h = harness().await;
+    let id = lima(&h).await;
+    // The delete terminates only after the create releases the lock.
+    let lock = h.state.create_lock.clone().lock_owned().await;
+    let (app, uri) = (h.app.clone(), format!("/v1/vms/{id}"));
+    let delete = tokio::spawn(async move { call_raw(&app, "DELETE", &uri, Some(STAGE)).await.0 });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(h.fake.actions().is_empty());
+    drop(lock);
+    assert_eq!(delete.await.unwrap(), StatusCode::ACCEPTED);
+    assert_eq!(h.fake.actions(), [(id, Action::Terminate)]);
 }

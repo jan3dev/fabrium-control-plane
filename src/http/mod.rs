@@ -1,3 +1,4 @@
+mod agents;
 mod health;
 mod ping;
 mod redeem;
@@ -25,6 +26,21 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/vms/{id}/stop", vms::action(Action::Stop))
         .route("/v1/vms/{id}/reboot", vms::action(Action::Reboot))
         .route("/v1/vms/{id}/auto-stop", put(vms::set_auto_stop))
+        .route(
+            "/v1/vms/{id}/recreate",
+            post(vms::recreate).layer(DefaultBodyLimit::max(vms::MAX_BODY)),
+        )
+        .route(
+            "/v1/agents",
+            get(agents::list)
+                .merge(post(agents::create).layer(DefaultBodyLimit::max(agents::MAX_BODY))),
+        )
+        .route(
+            "/v1/agents/{id}",
+            put(agents::change)
+                .layer(DefaultBodyLimit::max(agents::MAX_BODY))
+                .merge(delete(agents::delete)),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_key,
@@ -33,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health::health))
         .route("/v1/bootstrap", post(redeem::redeem))
         .route("/v1/vm/auto-stop", get(redeem::auto_stop))
+        .route("/v1/vm/agents", get(redeem::vm_agents))
         .merge(protected)
         .with_state(state)
 }
