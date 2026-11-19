@@ -54,7 +54,7 @@ struct ChangeAgent {
     rooms: Option<Vec<String>>,
 }
 
-fn unknown_project() -> AppError {
+pub(crate) fn unknown_project() -> AppError {
     AppError::BadRequest("unknown project".to_owned())
 }
 

@@ -27,6 +27,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/vms/{id}/stop", vms::action(Action::Stop))
         .route("/v1/vms/{id}/reboot", vms::action(Action::Reboot))
         .route("/v1/vms/{id}/auto-stop", put(vms::set_auto_stop))
+        .route("/v1/vms/{id}/owner", put(vms::set_owner_route))
         .route(
             "/v1/vms/{id}/recreate",
             post(vms::recreate).layer(DefaultBodyLimit::max(vms::MAX_BODY)),
