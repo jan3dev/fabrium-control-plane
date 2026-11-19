@@ -96,7 +96,7 @@ cargo run -p migration -- down
 cargo run -p migration -- status
 ```
 
-The CLI reads `DATABASE_URL`. The service runs the migrations at start. The database holds the VM registry (see [Auto-stop](#auto-stop)) and the agent records (see [Agents](#agents)); in Docker it is in the named volume `data`, which survives a new image.
+The CLI reads `DATABASE_URL`. The service runs the migrations at start. The database holds the VM registry (see [Auto-stop](#auto-stop)), the agent records (see [Agents](#agents)), and the projects (see [Projects](#projects)); in Docker it is in the named volume `data`, which survives a new image.
 
 ## API
 
@@ -115,12 +115,17 @@ A valid key also needs a source address. The address is the last `X-Forwarded-Fo
 | POST | `/v1/vms/{id}/stop` | `202 vm` | `404`, `409`, `502` |
 | POST | `/v1/vms/{id}/reboot` | `202 vm` | `404`, `409`, `502` |
 | PUT | `/v1/vms/{id}/auto-stop` | `200 vm` | `400`, `404`, `409`, `502` |
+| PUT | `/v1/vms/{id}/owner` | `200 vm` | `400`, `404`, `409`, `502` |
 | DELETE | `/v1/vms/{id}` | `202`, empty body | `404`, `502` |
 | POST | `/v1/vms/{id}/recreate` | `201 vm` | `400`, `404`, `409`, `413`, `502` |
 | GET | `/v1/agents` | `200 [agent]`, sorted by `created_at`, then `id` | |
 | POST | `/v1/agents` | `201 agent` | `400`, `409`, `413` |
 | PUT | `/v1/agents/{id}` | `200 agent` | `400`, `404`, `409`, `413` |
 | DELETE | `/v1/agents/{id}` | `204`, empty body | `404` |
+| GET | `/v1/projects` | `200 [project]`, sorted by `name` without regard to ASCII case, then `id` | |
+| POST | `/v1/projects` | `201 project` | `400`, `409` |
+| PUT | `/v1/projects/{id}` | `200 project` | `400`, `404`, `409` |
+| DELETE | `/v1/projects/{id}` | `204`, empty body | `404`, `409` |
 | POST | `/v1/bootstrap` | `200 {"files":[...],"script":"..."}` | `404`, `502` |
 | GET | `/v1/vm/auto-stop` | `200 {"auto_stop_hours":N}` | `404` |
 | GET | `/v1/vm/agents` | `200 {"agents":[...]}` | `404` |
@@ -143,7 +148,8 @@ A VM:
   "setup": "delivered",
   "auto_stop_hours": 12,
   "creator": "@ann:example.org",
-  "registered": true
+  "registered": true,
+  "project_id": null
 }
 ```
 
@@ -156,6 +162,7 @@ A VM:
 - `auto_stop_hours` comes from the registry. For a VM without a registry row it is the value of the tag `fabrium:auto-stop-hours`, or `null` if the tag is missing or not an integer. The VM powers itself off when its uptime reaches this many hours. EC2 then shows it as `stopped`.
 - `creator` is the Matrix user that the create named, or `null`.
 - `registered` is `true` if the VM has a registry row. Only then can the API change its hours.
+- `project_id` is the project of the registry row. A project is a named group of agents and VMs of a tenant (see [Projects](#projects)). `null` means a personal VM, and a VM without a registry row has `null` too.
 
 An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and are cached after the first success.
 
@@ -186,6 +193,7 @@ An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and 
 | `instance_type` | Optional. In `INSTANCE_TYPES`. The default is `DEFAULT_INSTANCE_TYPE`. |
 | `auto_stop_hours` | Optional integer from 1 to 168. The default is 12. |
 | `creator` | Optional. A Matrix user id: `@localpart:server`, printable ASCII without spaces, at most 255 bytes. |
+| `project_id` | Optional. The `id` of a project of the tenant, else `400 {"error":"unknown project"}` before any launch. |
 | `files[].path` | Starts with `/` and does not end with `/`. No `..` segment. No control character, such as a newline or a NUL byte. |
 | `files[].mode` | `^[0-7]{3,4}$` |
 | `files[].owner` | `^[a-z_][a-z0-9_-]{0,31}$` |
@@ -194,19 +202,27 @@ An instance type, in the order of `INSTANCE_TYPES`. The sizes come from EC2 and 
 
 A body larger than 256 KiB gives `413`. If a VM of the same tenant that is not terminated has the name, the result is `409 {"error":"name in use"}`. A VM of another tenant, or a terminated VM, does not count. A VM that still waits for its token also holds its name, even if EC2 does not list it yet. A VM that you delete keeps its name until EC2 reports it as `terminated`, usually after about a minute, so a create with the same name right after a delete can give `409`.
 
-Creates run one at a time: one lock, held from the name check to the insert of the payload (about 3 s), stops two requests with one name from both passing the name check. A create also runs in a task of its own, so the 10 s request timeout cannot separate the launch from the insert of the payload: a VM that EC2 accepted always has its payload, and never holds its name without one. The task keeps the lock until the payload is in the store, and the SDK timeouts bound that time. To run creates in parallel, use a lock per tenant and name. With more than one control plane instance, the lock must be shared.
+Creates run one at a time: one lock, held from the name check to the insert of the registry row (about 3 s), stops two requests with one name from both passing the name check, and keeps a project from being deleted between its check and the row that holds it. A create also runs in a task of its own, so the 10 s request timeout cannot separate the launch from the insert of the payload: a VM that EC2 accepted always has its payload, and never holds its name without one. The task keeps the lock until the registry row is in, and the SDK timeouts bound that time. To run creates in parallel, use a lock per tenant and name. With more than one control plane instance, the lock must be shared.
 
 ### Replace a VM
 
 `POST /v1/vms/{id}/recreate` with `{"bootstrap": {...}}` terminates the VM and launches a new one in its place. It gives a VM new credentials. The files of the old VM are lost. It works in any state that the list shows, as a delete does.
 
-- What stays: the name, the instance type, and the creator and the auto-stop hours of the registry row (see [Auto-stop](#auto-stop)). The agents of the name stay too (see [Agents](#agents)).
+- What stays: the name, the instance type, and the creator, the project, and the auto-stop hours of the registry row (see [Auto-stop](#auto-stop)). The agents of the name stay too (see [Agents](#agents)).
 - What is new: the instance id, the payload of the body, the bootstrap token, and the VM token. The VM token of the old VM stops working.
 - The payload has the rules of a create, and a body larger than 256 KiB gives `413`. The service does not check the name, because the old VM holds it until EC2 reports it as `terminated`. It does not check the instance type against `INSTANCE_TYPES` either, because the list can change after the create.
 - A VM without a registry row gives `409 {"error":"vm has no registry row"}`, and nothing changes. Delete it and create it again.
 - If the launch fails after the terminate, the answer is `502`. The old VM is gone, with its registry row. Its agents keep their records. Once EC2 reports the old VM as `terminated`, a create with the same name brings the VM back.
 
-A replace holds the lock of the creates from the read of the registry row to the insert of the new payload, so two replaces of one VM launch one VM: the second gets the `409`. A delete holds the same lock from the terminate to the drop of the row, so a replace that comes after a delete of the same VM gets the `409` too, and a delete that comes after a replace terminates the old VM and keeps the new one. A replace runs in a task of its own, as a create does.
+A replace holds the lock of the creates from the read of the registry row to the insert of the new row, so two replaces of one VM launch one VM: the second gets the `409`. A delete holds the same lock from the terminate to the drop of the row, so a replace that comes after a delete of the same VM gets the `409` too, and a delete that comes after a replace terminates the old VM and keeps the new one. A replace runs in a task of its own, as a create does.
+
+### Owner of a VM
+
+`PUT /v1/vms/{id}/owner` with `{"project_id": "..."}`, `{"creator": "@ann:example.org"}`, or both, changes the registry row in one statement. `"project_id": ""` makes the VM personal again. The rules are in section 1 of [the projects contracts](docs/superpowers/plans/2026-11-19-agents-projects-contracts.md).
+
+- A body with neither field, or with another field, gives `400 {"error":"invalid request body"}`. A `creator` gets the rule of a create.
+- A `project_id` that is not a project of the tenant gives `400 {"error":"unknown project"}`, and nothing changes, the `creator` of the body neither.
+- A VM of another tenant, and an unknown VM, give `404`. A VM without a registry row gives `409 {"error":"vm has no registry row"}`.
 
 ### Actions
 
@@ -225,7 +241,7 @@ A failed AWS call gives `502 {"error":"aws request failed"}`. The AWS detail goe
 
 ### Auto-stop
 
-The registry, a table in the database, holds the auto-stop hours (1 to 168) and the creator of each VM that the API launched, and the SHA-256 of a VM token. A watcher in the VM reads the hours with that token every 5 minutes and powers the VM off when the uptime reaches them. The shutdown behavior stays `stop`, so the VM ends as `stopped`.
+The registry, a table in the database, holds the auto-stop hours (1 to 168), the creator, and the project of each VM that the API launched, and the SHA-256 of a VM token. A watcher in the VM reads the hours with that token every 5 minutes and powers the VM off when the uptime reaches them. The shutdown behavior stays `stop`, so the VM ends as `stopped`.
 
 - A create writes the row and adds two root-owned files to the payload: `/etc/fabrium/vm-token` (mode `600`, 32 random bytes in base64url) and `/etc/fabrium/control-plane-url` (`PUBLIC_URL`). It also sets the tag `fabrium:auto-stop-hours` at launch, as a first value for the watcher, and turns on instance tags in IMDS (`InstanceMetadataTags=enabled`).
 - `GET /v1/vm/auto-stop` with `Authorization: Bearer <VM token>` returns `{"auto_stop_hours": N}`. It needs no tenant key and checks no address, because a VM gets a new address after a stop. Any other token gives `404`.
@@ -248,6 +264,7 @@ The control plane stores the agent records of each tenant and checks their field
   "model": "glm-5-3",
   "tag": "Reviewer",
   "project": "Payments",
+  "project_id": "9a1c0e2b4c6d8a0f5f0c2d7a9b3e4c1d",
   "vm": "lima",
   "rooms": ["#general:example.org"],
   "created_at": "2026-11-18T19:00:00Z",
@@ -257,6 +274,7 @@ The control plane stores the agent records of each tenant and checks their field
 
 A record holds the name of the agent, its owner (a Matrix user), its description (the instructions of the agent), its model, a tag and a project (labels, or `null`), and the name of its VM with the rooms that the agent joins. The service makes the `id`. The rules of each field, and the bodies of the writes, are in section 1 of [the agent contracts](docs/superpowers/plans/2026-11-18-agents-management-contracts.md). A field that breaks a rule gives `400`, and a body larger than 128 KiB gives `413`.
 
+- `project_id` is the `id` of a project of the tenant (see [Projects](#projects)), or `null` for a personal agent. Both writes take it, `""` in a change clears it, and a `project_id` that is not a project of the tenant gives `400 {"error":"unknown project"}` (rules in section 1 of [the projects contracts](docs/superpowers/plans/2026-11-19-agents-projects-contracts.md)). The text `project` of the first release stays: the service accepts, stores, and returns it, and gives it no meaning.
 - An agent without a VM is a profile: its `vm` is `null` and its `rooms` is `[]`. Two profiles can have the same name.
 - `POST /v1/agents` creates a profile, or an agent on a VM when the body has `vm` and `rooms`.
 - `PUT /v1/agents/{id}` changes the fields that the body names. `""` clears `tag` and `project`. It sets `vm` and `rooms` only on a profile: an agent that has a `vm` gives `409 {"error":"vm already set"}`. The name never changes.
@@ -267,10 +285,29 @@ A record holds the name of the agent, its owner (a Matrix user), its description
 A VM reads its agents with its VM token (see [Auto-stop](#auto-stop)). `GET /v1/vm/agents` with `Authorization: Bearer <VM token>` returns the agents whose `vm` is the name of that VM, in its tenant, sorted by name, with only what the VM needs to run them:
 
 ```json
-{ "agents": [ { "name": "reviewer", "description": "...", "model": "glm-5-3", "rooms": ["#general:example.org"] } ] }
+{ "agents": [
+  { "name": "reviewer", "description": "...", "model": "glm-5-3", "rooms": ["#general:example.org"], "senders": ["@ann:example.org"] },
+  { "name": "triage", "description": "...", "model": "glm-5-3", "rooms": ["#general:example.org"], "senders": null }
+] }
 ```
 
-It has the rules of `GET /v1/vm/auto-stop`: no tenant key, no source address check, and `404` for any other token. A VM without agents gets `{"agents":[]}`. The answer holds no secret.
+`senders` is the list of users that the agent answers: `[owner]` for a personal agent, and `null` for a project agent, which shows no owner. It has the rules of `GET /v1/vm/auto-stop`: no tenant key, no source address check, and `404` for any other token. A VM without agents gets `{"agents":[]}`. The answer holds no secret.
+
+### Projects
+
+A project is a named group of agents and VMs of a tenant. An agent or a VM with a `project_id` belongs to it, and one with `null` is personal. The project object:
+
+```json
+{ "id": "9a1c0e2b4c6d8a0f5f0c2d7a9b3e4c1d", "name": "Payments", "created_at": "2026-11-19T19:00:00Z", "updated_at": "2026-11-19T19:00:00Z" }
+```
+
+The rules of each field and every error are in section 1 of [the projects contracts](docs/superpowers/plans/2026-11-19-agents-projects-contracts.md).
+
+- A name is 1 to 64 characters, without control characters or white space at either end, and unique in the tenant when the case of ASCII letters is ignored. A rename that changes only the case is allowed.
+- `DELETE /v1/projects/{id}` gives `409 {"error":"project in use"}` while an agent or a registry row of a VM of the tenant has the project. The check and the delete are one statement.
+- A VM that was terminated outside the control plane keeps its registry row. So before the delete, the service drops the rows of the project that are older than 10 minutes and whose VM EC2 no longer lists. A newer row still counts, because EC2 lists a new VM late. If the EC2 list fails, nothing is dropped and the delete goes on.
+- A project of another tenant, and an `{id}` that is not 32 lowercase hex characters, give `404 {"error":"not found"}`.
+- The service checks the data only. It does not check who the caller is: zooid does.
 
 ### Bootstrap
 
