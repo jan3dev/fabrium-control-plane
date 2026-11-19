@@ -16,6 +16,8 @@ pub struct Agent {
     pub model: String,
     pub tag: Option<String>,
     pub project: Option<String>,
+    /// The project of the tenant that the agent belongs to. `None`: a personal agent.
+    pub project_id: Option<String>,
     pub vm: Option<String>,
     pub rooms: Vec<String>,
     pub created_at: String,
@@ -29,12 +31,16 @@ pub struct NewAgent<'a> {
     pub model: &'a str,
     pub tag: Option<&'a str>,
     pub project: Option<&'a str>,
+    pub project_id: Option<&'a str>,
     /// The VM name and the rooms, together.
     pub placement: Option<(&'a str, &'a [String])>,
 }
 
-const COLUMNS: &str =
-    "id, name, owner, description, model, tag, project, vm, rooms, created_at, updated_at";
+const COLUMNS: &str = "id, name, owner, description, model, tag, project, project_id, vm, rooms, \
+                       created_at, updated_at";
+
+/// The condition that `?` is a project of the tenant `?`.
+const PROJECT_OF_TENANT: &str = "EXISTS (SELECT 1 FROM projects WHERE id = ? AND tenant = ?)";
 
 fn stmt(sql: &str, values: Vec<Value>) -> Statement {
     Statement::from_sql_and_values(DbBackend::Sqlite, sql, values)
@@ -61,6 +67,7 @@ fn agent(row: &QueryResult) -> Result<Agent, DbErr> {
         model: row.try_get("", "model")?,
         tag: row.try_get("", "tag")?,
         project: row.try_get("", "project")?,
+        project_id: row.try_get("", "project_id")?,
         vm: row.try_get("", "vm")?,
         rooms: serde_json::from_str(&rooms).map_err(|e| DbErr::Custom(format!("rooms: {e}")))?,
         created_at: row.try_get("", "created_at")?,
@@ -68,16 +75,20 @@ fn agent(row: &QueryResult) -> Result<Agent, DbErr> {
     })
 }
 
+/// `None`: the project is not a project of the tenant. The insert and the check are one statement.
 pub async fn insert(
     db: &DatabaseConnection,
     tenant: &str,
     agent: &NewAgent<'_>,
-) -> Result<Agent, DbErr> {
+) -> Result<Option<Agent>, DbErr> {
     let id = new_id();
     let (vm, rooms) = agent.placement.unzip();
-    let sql =
-        "INSERT INTO agents (id, tenant, name, owner, description, model, tag, project, vm, rooms)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    let sql = format!(
+        "INSERT INTO agents
+           (id, tenant, name, owner, description, model, tag, project, vm, rooms, project_id)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ? IS NULL OR {PROJECT_OF_TENANT}"
+    );
+    let project_id = || agent.project_id.map(str::to_owned);
     let values = vec![
         id.as_str().into(),
         tenant.into(),
@@ -89,9 +100,18 @@ pub async fn insert(
         agent.project.map(str::to_owned).into(),
         vm.map(str::to_owned).into(),
         rooms_text(rooms.unwrap_or_default()).into(),
+        project_id().into(),
+        project_id().into(),
+        project_id().into(),
+        tenant.into(),
     ];
-    db.execute_raw(stmt(sql, values)).await?;
-    (get(db, tenant, &id).await?).ok_or_else(|| DbErr::Custom(format!("agent {id} not stored")))
+    if db.execute_raw(stmt(&sql, values)).await?.rows_affected() == 0 {
+        return Ok(None);
+    }
+    let agent = get(db, tenant, &id).await?;
+    agent
+        .ok_or_else(|| DbErr::Custom(format!("agent {id} not stored")))
+        .map(Some)
 }
 
 /// The agents of a tenant, by `created_at`, then `id`.
@@ -118,7 +138,7 @@ pub async fn get(db: &DatabaseConnection, tenant: &str, id: &str) -> Result<Opti
     row.as_ref().map(agent).transpose()
 }
 
-/// `None` keeps a value. For `tag` and `project`, `Some("")` stores NULL.
+/// `None` keeps a value. For `tag`, `project`, and `project_id`, `Some("")` stores NULL.
 #[derive(Default)]
 pub struct Changes {
     pub owner: Option<String>,
@@ -126,10 +146,12 @@ pub struct Changes {
     pub model: Option<String>,
     pub tag: Option<String>,
     pub project: Option<String>,
+    pub project_id: Option<String>,
     pub placement: Option<(String, Vec<String>)>,
 }
 
-/// One UPDATE. With `placement`, it applies only to a row whose `vm` is NULL. `false`: no row
+/// One UPDATE. With `placement`, it applies only to a row whose `vm` is NULL. With a
+/// `project_id` that is not empty, only if that is a project of the tenant. `false`: no row
 /// changed. With no change, it reports whether the row exists.
 pub async fn update(
     db: &DatabaseConnection,
@@ -154,6 +176,9 @@ pub async fn update(
     if let Some(project) = &changes.project {
         sets.push(("project", label(project).into()));
     }
+    if let Some(project_id) = &changes.project_id {
+        sets.push(("project_id", label(project_id).into()));
+    }
     if let Some((vm, rooms)) = &changes.placement {
         sets.push(("vm", vm.as_str().into()));
         sets.push(("rooms", rooms_text(rooms).into()));
@@ -172,13 +197,22 @@ pub async fn update(
     } else {
         ""
     };
+    let project = (changes.project_id.as_ref()).filter(|p| !p.is_empty());
+    let only_known = if project.is_some() {
+        format!(" AND {PROJECT_OF_TENANT}")
+    } else {
+        String::new()
+    };
     let sql = format!(
         "UPDATE agents SET {}, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-         WHERE tenant = ? AND id = ?{only_profile}",
+         WHERE tenant = ? AND id = ?{only_profile}{only_known}",
         columns.join(", ")
     );
     let mut values: Vec<Value> = sets.into_iter().map(|(_, value)| value).collect();
     values.extend([tenant.into(), id.into()]);
+    if let Some(project) = project {
+        values.extend([project.as_str().into(), tenant.into()]);
+    }
     let done = db.execute_raw(stmt(&sql, values)).await?;
     Ok(done.rows_affected() > 0)
 }

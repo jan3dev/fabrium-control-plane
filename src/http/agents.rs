@@ -16,6 +16,7 @@ use crate::{
     agents::{self, Agent, Changes, NewAgent},
     auth::Client,
     error::AppError,
+    projects,
 };
 
 /// The largest body of an agent write. A larger one gives 413.
@@ -34,6 +35,7 @@ struct CreateAgent {
     description: String,
     tag: Option<String>,
     project: Option<String>,
+    project_id: Option<String>,
     vm: Option<String>,
     rooms: Option<Vec<String>>,
 }
@@ -47,8 +49,13 @@ struct ChangeAgent {
     model: Option<String>,
     tag: Option<String>,
     project: Option<String>,
+    project_id: Option<String>,
     vm: Option<String>,
     rooms: Option<Vec<String>>,
+}
+
+fn unknown_project() -> AppError {
+    AppError::BadRequest("unknown project".to_owned())
 }
 
 fn check(ok: bool, message: &str) -> Result<(), AppError> {
@@ -181,9 +188,11 @@ pub async fn create(
         model: &request.model,
         tag: request.tag.as_deref(),
         project: request.project.as_deref(),
+        project_id: request.project_id.as_deref(),
         placement: (placement.as_ref()).map(|(vm, rooms)| (vm.as_str(), rooms.as_slice())),
     };
     let agent = (agents::insert(&state.db, &client.name, &new).await).map_err(name_in_use)?;
+    let agent = agent.ok_or_else(unknown_project)?;
     tracing::info!(tenant = %client.name, agent = %agent.id, "agent created");
     Ok((StatusCode::CREATED, Json(agent)))
 }
@@ -216,14 +225,22 @@ pub async fn change(
         model: request.model,
         tag: request.tag,
         project: request.project,
+        project_id: request.project_id,
     };
     let tenant = &client.name;
     if !(agents::update(&state.db, tenant, &id, &changes).await).map_err(name_in_use)? {
-        // No row changed: the agent is not there, or the change sets a `vm` that it has.
-        return Err(match agents::get(&state.db, tenant, &id).await? {
-            Some(_) => AppError::Conflict("vm already set".to_owned()),
-            None => AppError::NotFound,
-        });
+        // No row changed: the agent is not there, the project is not one of the tenant, or the
+        // change sets a `vm` that the agent has.
+        if agents::get(&state.db, tenant, &id).await?.is_none() {
+            return Err(AppError::NotFound);
+        }
+        let project = (changes.project_id.as_deref()).filter(|p| !p.is_empty());
+        if let Some(project) = project
+            && !projects::exists(&state.db, tenant, project).await?
+        {
+            return Err(unknown_project());
+        }
+        return Err(AppError::Conflict("vm already set".to_owned()));
     }
     let agent = (agents::get(&state.db, tenant, &id).await?).ok_or(AppError::NotFound)?;
     tracing::info!(%tenant, agent = %id, "agent changed");
