@@ -2,6 +2,7 @@ pub use sea_orm_migration::prelude::*;
 
 mod m20261111_000001_vms;
 mod m20261118_000001_agents;
+mod m20261119_000001_projects;
 
 pub struct Migrator;
 
@@ -11,6 +12,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20261111_000001_vms::Migration),
             Box::new(m20261118_000001_agents::Migration),
+            Box::new(m20261119_000001_projects::Migration),
         ]
     }
 }

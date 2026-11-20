@@ -110,13 +110,16 @@ pub struct VmAgents {
     agents: Vec<VmAgent>,
 }
 
-/// What a VM needs to run an agent. No owner, tag, or project: the VM does not use them.
+/// What a VM needs to run an agent. No tag or project. The owner shows only as the sender of
+/// a personal agent: the one user it answers.
 #[derive(Serialize)]
 struct VmAgent {
     name: String,
     description: String,
     model: String,
     rooms: Vec<String>,
+    /// `[owner]` for a personal agent, `null` (never a missing key) for a project agent.
+    senders: Option<Vec<String>>,
 }
 
 /// `GET /v1/vm/agents`: a VM reads the agents of its name, in its tenant, with its VM token.
@@ -131,6 +134,7 @@ pub async fn vm_agents(
     let agents = (agents::of_vm(&state.db, &tenant, &vm).await?)
         .into_iter()
         .map(|a| VmAgent {
+            senders: a.project_id.is_none().then(|| vec![a.owner]),
             name: a.name,
             description: a.description,
             model: a.model,

@@ -1,5 +1,5 @@
-//! The VM registry: the creator and the auto-stop hours of each VM that the API launched, and
-//! the SHA-256 of the VM token that the VM reads its hours with. A VM launched before the
+//! The VM registry: the creator, the project, and the auto-stop hours of each VM that the API
+//! launched, and the SHA-256 of the VM token that the VM reads its hours with. A VM launched before the
 //! registry has no row: its hours come from its tag, and the API cannot change them.
 
 use std::collections::HashMap;
@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 pub struct Record {
     pub creator: Option<String>,
     pub auto_stop_hours: u32,
+    pub project_id: Option<String>,
 }
 
 pub struct NewVm<'a> {
@@ -21,6 +22,7 @@ pub struct NewVm<'a> {
     pub name: &'a str,
     pub creator: Option<&'a str>,
     pub auto_stop_hours: u32,
+    pub project_id: Option<&'a str>,
     /// The VM token. Only its SHA-256 is stored.
     pub token: &'a str,
 }
@@ -42,12 +44,18 @@ fn record(row: &QueryResult) -> Result<Record, DbErr> {
     Ok(Record {
         creator: row.try_get("", "creator")?,
         auto_stop_hours: hours(row)?,
+        project_id: row.try_get("", "project_id")?,
     })
 }
 
-pub async fn insert(db: &DatabaseConnection, vm: &NewVm<'_>) -> Result<(), DbErr> {
-    let sql = "INSERT INTO vms (instance_id, tenant, name, creator, auto_stop_hours, token_hash)
-               VALUES (?, ?, ?, ?, ?, ?)";
+/// One INSERT. It stores `project_id` only while that is a project of the tenant: a project
+/// deleted during the launch gives NULL, a personal VM. Returns the stored `project_id`.
+pub async fn insert(db: &DatabaseConnection, vm: &NewVm<'_>) -> Result<Option<String>, DbErr> {
+    let sql = "INSERT INTO vms
+                 (instance_id, tenant, name, creator, auto_stop_hours, token_hash, project_id)
+               VALUES (?, ?, ?, ?, ?, ?,
+                       (SELECT id FROM projects WHERE id = ? AND tenant = ?))
+               RETURNING project_id";
     let values = vec![
         vm.instance_id.into(),
         vm.tenant.into(),
@@ -55,8 +63,12 @@ pub async fn insert(db: &DatabaseConnection, vm: &NewVm<'_>) -> Result<(), DbErr
         vm.creator.map(str::to_owned).into(),
         i64::from(vm.auto_stop_hours).into(),
         token_hash(vm.token).into(),
+        vm.project_id.map(str::to_owned).into(),
+        vm.tenant.into(),
     ];
-    db.execute_raw(stmt(sql, values)).await.map(|_| ())
+    let row = db.query_one_raw(stmt(sql, values)).await?;
+    let row = row.ok_or_else(|| DbErr::Custom(format!("vm {} not stored", vm.instance_id)))?;
+    row.try_get("", "project_id")
 }
 
 /// The rows of a tenant, by instance id.
@@ -64,7 +76,7 @@ pub async fn of_tenant(
     db: &DatabaseConnection,
     tenant: &str,
 ) -> Result<HashMap<String, Record>, DbErr> {
-    let sql = "SELECT instance_id, creator, auto_stop_hours FROM vms WHERE tenant = ?";
+    let sql = "SELECT instance_id, creator, auto_stop_hours, project_id FROM vms WHERE tenant = ?";
     let rows = db.query_all_raw(stmt(sql, vec![tenant.into()])).await?;
     (rows.iter())
         .map(|row| Ok((row.try_get("", "instance_id")?, record(row)?)))
@@ -76,7 +88,8 @@ pub async fn get(
     tenant: &str,
     instance_id: &str,
 ) -> Result<Option<Record>, DbErr> {
-    let sql = "SELECT creator, auto_stop_hours FROM vms WHERE tenant = ? AND instance_id = ?";
+    let sql = "SELECT creator, auto_stop_hours, project_id FROM vms
+               WHERE tenant = ? AND instance_id = ?";
     let row = db
         .query_one_raw(stmt(sql, vec![tenant.into(), instance_id.into()]))
         .await?;
@@ -97,6 +110,49 @@ pub async fn set_hours(
         instance_id.into(),
     ];
     let done = db.execute_raw(stmt(sql, values)).await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// `None` keeps a value. `project_id` `Some("")` stores NULL.
+pub struct OwnerChange {
+    pub project_id: Option<String>,
+    pub creator: Option<String>,
+}
+
+/// One UPDATE of the fields that `change` sets, at least one. With a `project_id` that is not
+/// empty, it applies only if that is a project of the tenant. `false`: no row changed (no row,
+/// or an unknown project).
+pub async fn set_owner(
+    db: &DatabaseConnection,
+    tenant: &str,
+    instance_id: &str,
+    change: &OwnerChange,
+) -> Result<bool, DbErr> {
+    let mut sets: Vec<(&str, Value)> = Vec::new();
+    if let Some(project_id) = &change.project_id {
+        let stored = (!project_id.is_empty()).then(|| project_id.clone());
+        sets.push(("project_id", stored.into()));
+    }
+    if let Some(creator) = &change.creator {
+        sets.push(("creator", creator.as_str().into()));
+    }
+    let columns: Vec<_> = sets.iter().map(|(c, _)| format!("{c} = ?")).collect();
+    let project = (change.project_id.as_deref()).filter(|p| !p.is_empty());
+    let only_known = if project.is_some() {
+        " AND EXISTS (SELECT 1 FROM projects WHERE id = ? AND tenant = ?)"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "UPDATE vms SET {} WHERE tenant = ? AND instance_id = ?{only_known}",
+        columns.join(", ")
+    );
+    let mut values: Vec<Value> = sets.into_iter().map(|(_, value)| value).collect();
+    values.extend([tenant.into(), instance_id.into()]);
+    if let Some(project) = project {
+        values.extend([project.into(), tenant.into()]);
+    }
+    let done = db.execute_raw(stmt(&sql, values)).await?;
     Ok(done.rows_affected() > 0)
 }
 
@@ -121,6 +177,22 @@ pub async fn vm_by_token(
     (row.as_ref())
         .map(|row| Ok((row.try_get("", "tenant")?, row.try_get("", "name")?)))
         .transpose()
+}
+
+/// The `instance_id` of the rows of the project that are older than 10 minutes.
+pub async fn old_rows_of_project(
+    db: &DatabaseConnection,
+    tenant: &str,
+    project_id: &str,
+) -> Result<Vec<String>, DbErr> {
+    let sql = "SELECT instance_id FROM vms WHERE tenant = ? AND project_id = ?
+               AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes')";
+    let rows = db
+        .query_all_raw(stmt(sql, vec![tenant.into(), project_id.into()]))
+        .await?;
+    rows.iter()
+        .map(|row| row.try_get("", "instance_id"))
+        .collect()
 }
 
 /// Drops the row of a VM, so its token stops working.

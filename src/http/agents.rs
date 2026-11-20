@@ -16,6 +16,7 @@ use crate::{
     agents::{self, Agent, Changes, NewAgent},
     auth::Client,
     error::AppError,
+    projects,
 };
 
 /// The largest body of an agent write. A larger one gives 413.
@@ -34,6 +35,7 @@ struct CreateAgent {
     description: String,
     tag: Option<String>,
     project: Option<String>,
+    project_id: Option<String>,
     vm: Option<String>,
     rooms: Option<Vec<String>>,
 }
@@ -47,8 +49,13 @@ struct ChangeAgent {
     model: Option<String>,
     tag: Option<String>,
     project: Option<String>,
+    project_id: Option<String>,
     vm: Option<String>,
     rooms: Option<Vec<String>>,
+}
+
+pub(crate) fn unknown_project() -> AppError {
+    AppError::BadRequest("unknown project".to_owned())
 }
 
 fn check(ok: bool, message: &str) -> Result<(), AppError> {
@@ -58,7 +65,7 @@ fn check(ok: bool, message: &str) -> Result<(), AppError> {
 
 /// The body, which must be a JSON object: serde also reads a struct from a positional array.
 /// A fixed message: a serde error can echo a value of the body.
-fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, AppError> {
+pub(crate) fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, AppError> {
     let invalid = || AppError::BadRequest("invalid request body".to_owned());
     if body.trim_ascii_start().first() != Some(&b'{') {
         return Err(invalid());
@@ -140,8 +147,8 @@ fn placement(
     }
 }
 
-/// The unique index of `(tenant, vm, name)` refused the row.
-fn name_in_use(e: DbErr) -> AppError {
+/// A unique index refused the row: `(tenant, vm, name)` of an agent, or the name of a project.
+pub(crate) fn name_in_use(e: DbErr) -> AppError {
     match e.sql_err() {
         Some(SqlErr::UniqueConstraintViolation(_)) => AppError::Conflict("name in use".to_owned()),
         _ => e.into(),
@@ -181,15 +188,18 @@ pub async fn create(
         model: &request.model,
         tag: request.tag.as_deref(),
         project: request.project.as_deref(),
+        project_id: request.project_id.as_deref(),
         placement: (placement.as_ref()).map(|(vm, rooms)| (vm.as_str(), rooms.as_slice())),
     };
     let agent = (agents::insert(&state.db, &client.name, &new).await).map_err(name_in_use)?;
+    let agent = agent.ok_or_else(unknown_project)?;
     tracing::info!(tenant = %client.name, agent = %agent.id, "agent created");
     Ok((StatusCode::CREATED, Json(agent)))
 }
 
-/// `^[0-9a-f]{32}$`. Any other id, one that does not decode included, is not found.
-fn agent_id(id: Result<Path<String>, PathRejection>) -> Result<String, AppError> {
+/// `^[0-9a-f]{32}$`, the id of an agent or a project. Any other id, one that does not decode
+/// included, is not found.
+pub(crate) fn hex_id(id: Result<Path<String>, PathRejection>) -> Result<String, AppError> {
     let id = vms::id_of(id)?;
     let valid = id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     valid.then_some(id).ok_or(AppError::NotFound)
@@ -201,7 +211,7 @@ pub async fn change(
     id: Result<Path<String>, PathRejection>,
     body: Bytes,
 ) -> Result<Json<Agent>, AppError> {
-    let id = agent_id(id)?;
+    let id = hex_id(id)?;
     let request: ChangeAgent = parse(&body)?;
     // `""` clears a tag or a project, so only a value that is not empty has the label rules.
     let labels = [request.tag.as_deref(), request.project.as_deref()];
@@ -215,14 +225,22 @@ pub async fn change(
         model: request.model,
         tag: request.tag,
         project: request.project,
+        project_id: request.project_id,
     };
     let tenant = &client.name;
     if !(agents::update(&state.db, tenant, &id, &changes).await).map_err(name_in_use)? {
-        // No row changed: the agent is not there, or the change sets a `vm` that it has.
-        return Err(match agents::get(&state.db, tenant, &id).await? {
-            Some(_) => AppError::Conflict("vm already set".to_owned()),
-            None => AppError::NotFound,
-        });
+        // No row changed: the agent is not there, the project is not one of the tenant, or the
+        // change sets a `vm` that the agent has.
+        if agents::get(&state.db, tenant, &id).await?.is_none() {
+            return Err(AppError::NotFound);
+        }
+        let project = (changes.project_id.as_deref()).filter(|p| !p.is_empty());
+        if let Some(project) = project
+            && !projects::exists(&state.db, tenant, project).await?
+        {
+            return Err(unknown_project());
+        }
+        return Err(AppError::Conflict("vm already set".to_owned()));
     }
     let agent = (agents::get(&state.db, tenant, &id).await?).ok_or(AppError::NotFound)?;
     tracing::info!(%tenant, agent = %id, "agent changed");
@@ -234,7 +252,7 @@ pub async fn delete(
     Extension(client): Extension<Client>,
     id: Result<Path<String>, PathRejection>,
 ) -> Result<StatusCode, AppError> {
-    let id = agent_id(id)?;
+    let id = hex_id(id)?;
     if !agents::remove(&state.db, &client.name, &id).await? {
         return Err(AppError::NotFound);
     }

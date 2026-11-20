@@ -71,6 +71,7 @@ async fn a_new_profile_has_an_id_and_no_vm() {
         "name",
         "owner",
         "project",
+        "project_id",
         "rooms",
         "tag",
         "updated_at",
@@ -557,6 +558,7 @@ async fn a_vm_reads_its_own_agents() {
             "description": format!("You are {name}."),
             "model": "glm-5-3",
             "rooms": ["#general:example.org"],
+            "senders": ["@ana:example.org"],
         })
     };
     let want = json!({ "agents": [entry("a"), entry("b")] });
@@ -626,4 +628,268 @@ async fn the_route_needs_no_source_address() {
     let auth = format!("Bearer {token}");
     let (status, body) = call_from(&h.app, "GET", "/v1/vm/agents", Some(&auth), None).await;
     assert_eq!((status, body), (StatusCode::OK, json!({ "agents": [] })));
+}
+
+/// Creates the project `name` through `POST /v1/projects` and returns its id.
+async fn project(h: &Harness, auth: &str, name: &str) -> String {
+    let body = serde_json::to_vec(&json!({ "name": name })).unwrap();
+    let (status, bytes) = send(&h.app, "POST", "/v1/projects", Some(auth), body).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let project: Value = serde_json::from_slice(&bytes).unwrap();
+    project["id"].as_str().unwrap().to_owned()
+}
+
+fn unknown_project() -> (StatusCode, Value) {
+    (
+        StatusCode::BAD_REQUEST,
+        json!({ "error": "unknown project" }),
+    )
+}
+
+#[tokio::test]
+async fn an_agent_has_a_null_project_id_by_default() {
+    let h = harness().await;
+    let agent = created(&h, STAGE, &agent_body("reviewer")).await;
+    // The key is there, with null.
+    assert_eq!(agent.get("project_id"), Some(&Value::Null));
+    assert_eq!(agent["project"], Value::Null);
+    assert_eq!(
+        stored(&h, STAGE, &agent).await.get("project_id"),
+        Some(&Value::Null)
+    );
+}
+
+#[tokio::test]
+async fn create_takes_a_project_id() {
+    let h = harness().await;
+    let id = project(&h, STAGE, "Payments").await;
+    let agent = created(
+        &h,
+        STAGE,
+        &with("reviewer", |b| b["project_id"] = json!(id)),
+    )
+    .await;
+    assert_eq!(agent["project_id"], id);
+    assert_eq!(stored(&h, STAGE, &agent).await["project_id"], id);
+}
+
+#[tokio::test]
+async fn the_text_project_of_phase_1_is_still_stored_and_returned() {
+    let h = harness().await;
+    let agent = created(
+        &h,
+        STAGE,
+        &with("reviewer", |b| b["project"] = json!("Legacy")),
+    )
+    .await;
+    assert_eq!(agent["project"], "Legacy");
+    assert_eq!(agent.get("project_id"), Some(&Value::Null));
+    let (status, changed) = put(&h, STAGE, &agent, &json!({ "project": "" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(changed["project"], Value::Null);
+}
+
+#[tokio::test]
+async fn an_unknown_project_id_is_refused_on_create_and_change() {
+    let h = harness().await;
+    let zeros = "0".repeat(32);
+    // `""` in a POST is not a project either: only a PUT reads it as "clear".
+    for id in [zeros.as_str(), "nope", ""] {
+        let body = with("reviewer", |b| b["project_id"] = json!(id));
+        assert_eq!(post(&h, STAGE, &body).await, unknown_project(), "{id}");
+    }
+    assert_eq!(list(&h, STAGE).await, json!([]));
+    let kept = project(&h, STAGE, "Payments").await;
+    let agent = created(
+        &h,
+        STAGE,
+        &with("reviewer", |b| b["project_id"] = json!(kept)),
+    )
+    .await;
+    for id in [zeros.as_str(), "nope"] {
+        let body = json!({ "project_id": id, "description": "d2" });
+        assert_eq!(
+            put(&h, STAGE, &agent, &body).await,
+            unknown_project(),
+            "{id}"
+        );
+    }
+    assert_eq!(stored(&h, STAGE, &agent).await, agent);
+}
+
+#[tokio::test]
+async fn a_project_of_another_tenant_is_unknown() {
+    let h = harness().await;
+    let theirs = project(&h, PROD, "Payments").await;
+    let body = with("reviewer", |b| b["project_id"] = json!(theirs));
+    assert_eq!(post(&h, STAGE, &body).await, unknown_project());
+    let agent = created(&h, STAGE, &agent_body("reviewer")).await;
+    let change = json!({ "project_id": theirs });
+    assert_eq!(put(&h, STAGE, &agent, &change).await, unknown_project());
+    assert_eq!(stored(&h, STAGE, &agent).await, agent);
+}
+
+#[tokio::test]
+async fn an_empty_project_id_clears_it() {
+    let h = harness().await;
+    let id = project(&h, STAGE, "Payments").await;
+    let agent = created(&h, STAGE, &agent_body("reviewer")).await;
+    let (status, changed) = put(&h, STAGE, &agent, &json!({ "project_id": id })).await;
+    assert_eq!(
+        (status, &changed["project_id"]),
+        (StatusCode::OK, &json!(id))
+    );
+    // A change without the field keeps it.
+    let (status, changed) = put(&h, STAGE, &agent, &json!({ "description": "d2" })).await;
+    assert_eq!(
+        (status, &changed["project_id"]),
+        (StatusCode::OK, &json!(id))
+    );
+    let (status, changed) = put(&h, STAGE, &agent, &json!({ "project_id": "" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(changed.get("project_id"), Some(&Value::Null));
+    assert_eq!(stored(&h, STAGE, &agent).await["project_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn a_change_that_names_a_project_and_a_vm_is_one_step() {
+    let h = harness().await;
+    let id = project(&h, STAGE, "Payments").await;
+    let agent = created(&h, STAGE, &agent_body("reviewer")).await;
+    let rooms = json!(["#general:example.org"]);
+    let first = json!({ "project_id": id, "vm": "lima", "rooms": rooms });
+    let (status, changed) = put(&h, STAGE, &agent, &first).await;
+    assert_eq!(status, StatusCode::OK);
+    let both = (&changed["project_id"], &changed["vm"], &changed["rooms"]);
+    assert_eq!(both, (&json!(id), &json!("lima"), &rooms));
+    // A second assign changes nothing: the project of the body neither.
+    let other = project(&h, STAGE, "Billing").await;
+    let second = json!({ "project_id": other, "vm": "cusco", "rooms": [] });
+    assert_eq!(
+        put(&h, STAGE, &agent, &second).await,
+        (StatusCode::CONFLICT, json!({ "error": "vm already set" }))
+    );
+    assert_eq!(stored(&h, STAGE, &agent).await["project_id"], id);
+}
+
+#[tokio::test]
+async fn a_missing_agent_with_an_unknown_project_is_not_found() {
+    let h = harness().await;
+    let body = serde_json::to_vec(&json!({ "project_id": "f".repeat(32) })).unwrap();
+    assert_eq!(
+        put_raw(&h, STAGE, &"0".repeat(32), body).await,
+        (StatusCode::NOT_FOUND, not_found())
+    );
+}
+
+#[tokio::test]
+async fn a_delete_of_a_project_cannot_leave_a_dangling_agent() {
+    let h = harness().await;
+    for n in 0..20 {
+        let id = project(&h, STAGE, &format!("p{n}")).await;
+        let body = with("reviewer", |b| b["project_id"] = json!(id));
+        let uri = format!("/v1/projects/{id}");
+        let (agent, deleted) = tokio::join!(
+            post(&h, STAGE, &body),
+            call(&h.app, "DELETE", &uri, Some(STAGE))
+        );
+        let in_list = list_has_project(&h, &id).await;
+        match (agent.0, deleted.0) {
+            (StatusCode::CREATED, StatusCode::CONFLICT) => {
+                assert_eq!(deleted.1, json!({ "error": "project in use" }));
+                assert!(in_list, "{n}");
+            }
+            (StatusCode::BAD_REQUEST, StatusCode::NO_CONTENT) => {
+                assert_eq!(agent, unknown_project());
+                assert!(!in_list, "{n}");
+            }
+            pair => panic!("{n}: {pair:?}"),
+        }
+    }
+}
+
+async fn list_has_project(h: &Harness, id: &str) -> bool {
+    let (status, projects) = call(&h.app, "GET", "/v1/projects", Some(STAGE)).await;
+    assert_eq!(status, StatusCode::OK);
+    projects.as_array().unwrap().iter().any(|p| p["id"] == id)
+}
+
+/// The entry of the agent `name` in the list of the VM.
+async fn vm_entry(h: &Harness, token: &str, name: &str) -> Value {
+    let (status, body) = vm_agents(h, token).await;
+    assert_eq!(status, StatusCode::OK);
+    let agents = body["agents"].as_array().unwrap();
+    let found = agents.iter().find(|a| a["name"] == name);
+    found.expect("the agent is in the list").clone()
+}
+
+#[tokio::test]
+async fn a_personal_agent_answers_only_its_owner() {
+    let h = harness().await;
+    let token = vm_token_of(&h, "lima").await;
+    created(&h, STAGE, &on("a", "lima")).await;
+    let entry = vm_entry(&h, &token, "a").await;
+    assert_eq!(entry["senders"], json!(["@ana:example.org"]));
+}
+
+#[tokio::test]
+async fn a_project_agent_has_null_senders() {
+    let h = harness().await;
+    let token = vm_token_of(&h, "lima").await;
+    let id = project(&h, STAGE, "Payments").await;
+    let mut body = on("b", "lima");
+    body["project_id"] = json!(id);
+    created(&h, STAGE, &body).await;
+    // The key is there, with null.
+    let entry = vm_entry(&h, &token, "b").await;
+    assert_eq!(entry.get("senders"), Some(&Value::Null));
+}
+
+#[tokio::test]
+async fn senders_follow_the_project_when_it_is_cleared_and_when_it_is_set() {
+    let h = harness().await;
+    let token = vm_token_of(&h, "lima").await;
+    let id = project(&h, STAGE, "Payments").await;
+    let mut body = on("b", "lima");
+    body["project_id"] = json!(id);
+    let agent = created(&h, STAGE, &body).await;
+    let (status, _) = put(&h, STAGE, &agent, &json!({ "project_id": "" })).await;
+    assert_eq!(status, StatusCode::OK);
+    // The owner stayed as data.
+    let entry = vm_entry(&h, &token, "b").await;
+    assert_eq!(entry["senders"], json!(["@ana:example.org"]));
+    let (status, _) = put(&h, STAGE, &agent, &json!({ "project_id": id })).await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = vm_entry(&h, &token, "b").await;
+    assert_eq!(entry.get("senders"), Some(&Value::Null));
+}
+
+#[tokio::test]
+async fn a_project_agent_hides_its_owner_from_the_vm() {
+    let h = harness().await;
+    let token = vm_token_of(&h, "lima").await;
+    let id = project(&h, STAGE, "Payments").await;
+    let mut body = on("b", "lima");
+    body["project_id"] = json!(id);
+    created(&h, STAGE, &body).await;
+    let entry = vm_entry(&h, &token, "b").await;
+    assert!(!entry.to_string().contains("@ana:example.org"), "{entry}");
+}
+
+#[tokio::test]
+async fn senders_are_per_tenant_and_per_vm_name() {
+    let h = harness().await;
+    let token = vm_token_of(&h, "lima").await;
+    created(&h, STAGE, &on("a", "lima")).await;
+    let mut theirs = on("a", "lima");
+    theirs["owner"] = json!("@luis:example.org");
+    created(&h, PROD, &theirs).await;
+    let mut cusco = on("c", "cusco");
+    cusco["owner"] = json!("@cy:example.org");
+    created(&h, STAGE, &cusco).await;
+    let (status, body) = vm_agents(&h, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    let agents = body["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1, "{body}");
+    assert_eq!(agents[0]["senders"], json!(["@ana:example.org"]));
 }
