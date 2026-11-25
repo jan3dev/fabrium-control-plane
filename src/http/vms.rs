@@ -11,13 +11,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::OwnedMutexGuard;
 use tracing::Instrument;
 
+use super::agents::{parse, unknown_project};
 use crate::{
     AppState,
     auth::Client,
     bootstrap::{self, File, Payload, Store},
     ec2::{self, Action, Instance, Launch},
     error::AppError,
-    registry::{self, NewVm, Record},
+    projects,
+    registry::{self, NewVm, OwnerChange, Record},
 };
 
 /// The largest body of `POST /v1/vms`. A larger one gives 413.
@@ -67,6 +69,8 @@ pub struct Vm {
     creator: Option<String>,
     /// The VM has a registry row: the API can change its hours.
     registered: bool,
+    /// The project of the registry row. `None` also for a VM without a row.
+    project_id: Option<String>,
 }
 
 impl Vm {
@@ -92,6 +96,7 @@ impl Vm {
                 .or(instance.auto_stop_hours),
             creator: record.and_then(|r| r.creator.clone()),
             registered: record.is_some(),
+            project_id: record.and_then(|r| r.project_id.clone()),
         }
     }
 }
@@ -258,6 +263,16 @@ struct CreateVm {
     auto_stop_hours: Option<i64>,
     /// The Matrix user who asked for the VM.
     creator: Option<String>,
+    project_id: Option<String>,
+}
+
+/// The rule of `creator`, for `POST /v1/vms` and `PUT /v1/vms/{id}/owner`.
+fn check_creator(creator: Option<&str>) -> Result<(), AppError> {
+    if creator.is_some_and(|c| !valid_creator(c)) {
+        let message = "creator must be a Matrix user id";
+        return Err(AppError::BadRequest(message.to_owned()));
+    }
+    Ok(())
 }
 
 /// `@localpart:server` in printable ASCII, at most 255 bytes (the Matrix limit).
@@ -302,10 +317,7 @@ pub async fn create(
         .validate()
         .map_err(|e| AppError::BadRequest(e.to_owned()))?;
     let auto_stop_hours = valid_hours(request.auto_stop_hours)?.unwrap_or(DEFAULT_AUTO_STOP_HOURS);
-    if (request.creator.as_deref()).is_some_and(|c| !valid_creator(c)) {
-        let message = "creator must be a Matrix user id";
-        return Err(AppError::BadRequest(message.to_owned()));
-    }
+    check_creator(request.creator.as_deref())?;
 
     // ponytail: one create at a time (README, "Create a VM"); a lock per tenant and name scales.
     let guard = state.create_lock.clone().lock_owned().await;
@@ -314,12 +326,19 @@ pub async fn create(
     let spec = LaunchSpec {
         name: request.name,
         creator: request.creator,
+        project_id: request.project_id,
         bootstrap: request.bootstrap,
     };
     // A task of its own: the 10 s request timeout must not split the launch from the payload.
     let task = tokio::spawn(
         async move {
             name_free(&state, &tenant, &spec.name).await?;
+            // A project deleted during the launch leaves the VM personal (`registry::insert`).
+            if let Some(project) = &spec.project_id
+                && !projects::exists(&state.db, &tenant, project).await?
+            {
+                return Err(unknown_project());
+            }
             launch_vm(
                 &state,
                 &tenant,
@@ -354,6 +373,7 @@ async fn name_free(state: &AppState, tenant: &str, name: &str) -> Result<(), App
 struct LaunchSpec {
     name: String,
     creator: Option<String>,
+    project_id: Option<String>,
     bootstrap: Payload,
 }
 
@@ -403,13 +423,15 @@ async fn launch_vm(
         name,
         creator: spec.creator.as_deref(),
         auto_stop_hours,
+        project_id: spec.project_id.as_deref(),
         token: &vm_token,
     };
     // The VM runs already. Without a row it keeps the hours of its tag, so only log.
     let record = match registry::insert(&state.db, &new).await {
-        Ok(()) => Some(Record {
+        Ok(project_id) => Some(Record {
             creator: spec.creator,
             auto_stop_hours,
+            project_id,
         }),
         Err(e) => {
             tracing::error!(vm = %instance.id, error = %e, "could not register the vm");
@@ -425,8 +447,8 @@ struct RecreateVm {
 }
 
 /// `POST /v1/vms/{id}/recreate`: terminates the VM and launches one with the same name, type,
-/// creator, and hours, with the new payload and a new VM token. It checks no name: the old VM
-/// holds it until EC2 reports it as terminated.
+/// creator, project, and hours, with the new payload and a new VM token. It checks no name: the
+/// old VM holds it until EC2 reports it as terminated.
 pub async fn recreate(
     State(state): State<AppState>,
     Extension(client): Extension<Client>,
@@ -458,6 +480,7 @@ pub async fn recreate(
             let spec = LaunchSpec {
                 name: old.name.clone(),
                 creator: record.creator,
+                project_id: record.project_id,
                 bootstrap: request.bootstrap,
             };
             let hours = record.auto_stop_hours;
@@ -471,4 +494,44 @@ pub async fn recreate(
         .await
         .map_err(|e| AppError::Aws(format!("recreate task failed: {e}")))??;
     Ok((StatusCode::CREATED, Json(vm)))
+}
+
+/// The body of `PUT /v1/vms/{id}/owner`: at least one field.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetOwner {
+    project_id: Option<String>,
+    creator: Option<String>,
+}
+
+/// `PUT /v1/vms/{id}/owner`: sets the project, the creator, or both, in the registry row of the
+/// VM, in one statement. `project_id` `""` clears the project.
+pub async fn set_owner_route(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    id: Result<Path<String>, PathRejection>,
+    body: Bytes,
+) -> Result<Json<Vm>, AppError> {
+    let id = id_of(id)?;
+    let vm = find(&state, &client.name, &id).await?;
+    let request: SetOwner = parse(&body)?;
+    if request.project_id.is_none() && request.creator.is_none() {
+        return Err(AppError::BadRequest("invalid request body".to_owned()));
+    }
+    check_creator(request.creator.as_deref())?;
+    let change = OwnerChange {
+        project_id: request.project_id,
+        creator: request.creator,
+    };
+    let tenant = &client.name;
+    if !registry::set_owner(&state.db, tenant, &vm.id, &change).await? {
+        // No row changed: the VM has no row, or the project is not one of the tenant.
+        return Err(match registry::get(&state.db, tenant, &vm.id).await? {
+            Some(_) => unknown_project(),
+            None => AppError::Conflict("vm has no registry row".to_owned()),
+        });
+    }
+    tracing::info!(%tenant, vm = %vm.id, "vm owner set");
+    let record = registry::get(&state.db, tenant, &vm.id).await?;
+    Ok(Json(Vm::new(&vm, &state.bootstrap, record.as_ref())))
 }

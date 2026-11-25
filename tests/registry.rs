@@ -280,3 +280,40 @@ async fn delete_revokes_the_vm_token() {
         (StatusCode::NOT_FOUND, not_found())
     );
 }
+
+#[tokio::test]
+async fn the_migration_keeps_the_rows_of_phase_1() {
+    use fabrium_control_plane::{agents, registry};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{ConnectionTrait, Database};
+
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    // The migrations of phase 1 only.
+    Migrator::up(&db, Some(2)).await.unwrap();
+    for sql in [
+        "INSERT INTO vms (instance_id, tenant, name, creator, auto_stop_hours, token_hash)
+         VALUES ('i-0000000000000001', 'stage', 'lima', '@ann:example.org', 6, 'h')",
+        "INSERT INTO agents (id, tenant, name, owner, model, project, vm, rooms)
+         VALUES ('00000000000000000000000000000001', 'stage', 'reviewer', '@ana:example.org',
+                 'glm-5-3', 'Legacy', 'lima', '[\"#general:example.org\"]')",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    Migrator::up(&db, None).await.unwrap();
+
+    let rows = registry::of_tenant(&db, "stage").await.unwrap();
+    let row = &rows["i-0000000000000001"];
+    assert_eq!(row.creator.as_deref(), Some("@ann:example.org"));
+    assert_eq!((row.auto_stop_hours, row.project_id.as_deref()), (6, None));
+    let agents = agents::of_tenant(&db, "stage").await.unwrap();
+    assert_eq!(agents.len(), 1);
+    let agent = &agents[0];
+    let kept = (
+        agent.name.as_str(),
+        agent.project.as_deref(),
+        agent.vm.as_deref(),
+    );
+    assert_eq!(kept, ("reviewer", Some("Legacy"), Some("lima")));
+    assert_eq!(agent.rooms, ["#general:example.org"]);
+    assert_eq!(agent.project_id, None);
+}

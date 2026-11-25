@@ -209,13 +209,15 @@ async fn list_shows_only_live_vms_of_the_caller_sorted_by_name() {
                 "id": "i-0000000000000001", "name": "a", "state": "stopped",
                 "instance_type": "m6a.large", "sev_snp": true, "public_ip": null,
                 "launched_at": "2026-10-26T19:00:00Z", "setup": "expired",
-                "auto_stop_hours": null, "creator": null, "registered": false
+                "auto_stop_hours": null, "creator": null, "registered": false,
+                "project_id": null
             },
             {
                 "id": "i-0000000000000002", "name": "b", "state": "running",
                 "instance_type": "t3a.medium", "sev_snp": false, "public_ip": "203.0.113.10",
                 "launched_at": "2026-10-26T19:00:00Z", "setup": "delivered",
-                "auto_stop_hours": 8, "creator": null, "registered": false
+                "auto_stop_hours": 8, "creator": null, "registered": false,
+                "project_id": null
             }
         ])
     );
@@ -1634,4 +1636,396 @@ async fn delete_waits_for_the_create_lock() {
     drop(lock);
     assert_eq!(delete.await.unwrap(), StatusCode::ACCEPTED);
     assert_eq!(h.fake.actions(), [(id, Action::Terminate)]);
+}
+
+/// Creates the project `name` through `POST /v1/projects` and returns its id.
+async fn project(h: &Harness, auth: &str, name: &str) -> String {
+    let body = serde_json::to_vec(&json!({ "name": name })).unwrap();
+    let (status, bytes) = send(&h.app, "POST", "/v1/projects", Some(auth), body).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let project: Value = serde_json::from_slice(&bytes).unwrap();
+    project["id"].as_str().unwrap().to_owned()
+}
+
+fn unknown_project() -> (StatusCode, Value) {
+    (
+        StatusCode::BAD_REQUEST,
+        json!({ "error": "unknown project" }),
+    )
+}
+
+/// Creates `lima` as `stage` in the project `project_id`, if any. Returns the VM.
+async fn lima_in(h: &Harness, project_id: Option<&str>) -> Value {
+    let body = with(|b| {
+        if let Some(id) = project_id {
+            b["project_id"] = json!(id);
+        }
+    });
+    let (status, vm) = create(&h.app, STAGE, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    vm
+}
+
+/// The `project_id` of the registry row of a VM.
+async fn row_project(h: &Harness, id: &str) -> Option<String> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let sql = "SELECT project_id FROM vms WHERE instance_id = ?";
+    let query = Statement::from_sql_and_values(DbBackend::Sqlite, sql, [id.into()]);
+    let row = h.state.db.query_one_raw(query).await.unwrap();
+    row.expect("a registry row")
+        .try_get("", "project_id")
+        .unwrap()
+}
+
+/// The VM of the list of `stage` with this id.
+async fn listed(h: &Harness, id: &Value) -> Value {
+    let (status, vms) = call(&h.app, "GET", "/v1/vms", Some(STAGE)).await;
+    assert_eq!(status, StatusCode::OK);
+    listed_vm(&vms, id)
+}
+
+/// `PUT /v1/vms/{id}/owner` with a raw body.
+async fn put_owner(h: &Harness, auth: &str, id: &str, body: &[u8]) -> (StatusCode, Value) {
+    let uri = format!("/v1/vms/{id}/owner");
+    let (status, bytes) = send(&h.app, "PUT", &uri, Some(auth), body.to_vec()).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn set_owner(h: &Harness, vm: &Value, body: &Value) -> (StatusCode, Value) {
+    let id = vm["id"].as_str().unwrap();
+    put_owner(h, STAGE, id, &serde_json::to_vec(body).unwrap()).await
+}
+
+#[tokio::test]
+async fn a_vm_has_a_null_project_id_by_default() {
+    let h = harness().await;
+    let vm = lima_in(&h, None).await;
+    // The key is there, with null.
+    assert_eq!(vm.get("project_id"), Some(&Value::Null));
+    assert_eq!(
+        listed(&h, &vm["id"]).await.get("project_id"),
+        Some(&Value::Null)
+    );
+    let legacy = "i-00000000aa";
+    h.fake
+        .seed(stage_vm(legacy, "old", "running", "t3a.medium"));
+    let old = listed(&h, &json!(legacy)).await;
+    assert_eq!(old.get("project_id"), Some(&Value::Null));
+}
+
+#[tokio::test]
+async fn create_takes_a_project_id_and_the_list_shows_it() {
+    let h = harness().await;
+    let id = project(&h, STAGE, "Payments").await;
+    let vm = lima_in(&h, Some(&id)).await;
+    assert_eq!(vm["project_id"], id);
+    assert_eq!(listed(&h, &vm["id"]).await["project_id"], id);
+    assert_eq!(row_project(&h, vm["id"].as_str().unwrap()).await, Some(id));
+}
+
+#[tokio::test]
+async fn create_refuses_an_unknown_project_before_it_launches() {
+    let h = harness().await;
+    let theirs = project(&h, PROD, "Payments").await;
+    // `""` in a POST is not a project either: only a PUT reads it as "clear".
+    for id in ["0".repeat(32), theirs, "nope".to_owned(), String::new()] {
+        let body = with(|b| b["project_id"] = json!(id));
+        assert_eq!(
+            create(&h.app, STAGE, &body).await,
+            unknown_project(),
+            "{id}"
+        );
+    }
+    assert!(h.fake.launches().is_empty());
+}
+
+#[tokio::test]
+async fn recreate_keeps_the_project() {
+    let h = harness().await;
+    let id = project(&h, STAGE, "Payments").await;
+    let vm = lima_in(&h, Some(&id)).await;
+    let body = recreate_body(json!(empty_payload()));
+    let (status, new) = recreate(&h, STAGE, vm["id"].as_str().unwrap(), &body).await;
+    assert_eq!(
+        (status, &new["project_id"]),
+        (StatusCode::CREATED, &json!(id))
+    );
+    let (status, newer) = recreate(&h, STAGE, new["id"].as_str().unwrap(), &body).await;
+    assert_eq!(
+        (status, &newer["project_id"]),
+        (StatusCode::CREATED, &json!(id))
+    );
+    assert_eq!(listed(&h, &newer["id"]).await["project_id"], id);
+    // A VM without a project stays without one.
+    let body_cusco = with(|b| b["name"] = json!("cusco"));
+    let (status, cusco) = create(&h.app, STAGE, &body_cusco).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, cusco) = recreate(&h, STAGE, cusco["id"].as_str().unwrap(), &body).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(cusco.get("project_id"), Some(&Value::Null));
+}
+
+#[tokio::test]
+async fn the_owner_route_sets_and_clears_the_project() {
+    let h = harness().await;
+    let id = project(&h, STAGE, "Payments").await;
+    let vm = lima_in(&h, None).await;
+    let (status, changed) = set_owner(&h, &vm, &json!({ "project_id": id })).await;
+    assert_eq!(
+        (status, &changed["project_id"]),
+        (StatusCode::OK, &json!(id))
+    );
+    assert_eq!(changed["id"], vm["id"]);
+    assert_eq!(listed(&h, &vm["id"]).await["project_id"], id);
+    let (status, changed) = set_owner(&h, &vm, &json!({ "project_id": "" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(changed.get("project_id"), Some(&Value::Null));
+    assert_eq!(listed(&h, &vm["id"]).await["project_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn the_owner_route_sets_the_creator_and_both_fields_at_once() {
+    let h = harness().await;
+    let first = project(&h, STAGE, "Payments").await;
+    let vm = lima_in(&h, Some(&first)).await;
+    let body = json!({ "creator": "@bea:example.org" });
+    let (status, changed) = set_owner(&h, &vm, &body).await;
+    assert_eq!(status, StatusCode::OK);
+    let fields = (&changed["creator"], &changed["project_id"]);
+    assert_eq!(fields, (&json!("@bea:example.org"), &json!(first)));
+    let second = project(&h, STAGE, "Billing").await;
+    let body = json!({ "project_id": second, "creator": "@cy:example.org" });
+    let (status, changed) = set_owner(&h, &vm, &body).await;
+    assert_eq!(status, StatusCode::OK);
+    let fields = (&changed["creator"], &changed["project_id"]);
+    assert_eq!(fields, (&json!("@cy:example.org"), &json!(second)));
+    let listed = listed(&h, &vm["id"]).await;
+    let fields = (&listed["creator"], &listed["project_id"]);
+    assert_eq!(fields, (&json!("@cy:example.org"), &json!(second)));
+    // The rule of the creator of `POST /v1/vms`.
+    assert_eq!(
+        set_owner(&h, &vm, &json!({ "creator": "bea" })).await,
+        (
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "creator must be a Matrix user id" })
+        )
+    );
+}
+
+#[tokio::test]
+async fn the_owner_route_refuses_bad_bodies() {
+    let h = harness().await;
+    let vm = lima_in(&h, None).await;
+    let id = vm["id"].as_str().unwrap();
+    for body in [
+        "{}",
+        r#"{"name":"x"}"#,
+        r#"{"project_id":1}"#,
+        r#"{"creator":null}"#,
+        r#"[{"creator":"@bea:example.org"}]"#,
+        r#"["@bea:example.org"]"#,
+        "nope",
+        "",
+    ] {
+        assert_eq!(
+            put_owner(&h, STAGE, id, body.as_bytes()).await,
+            (
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "invalid request body" })
+            ),
+            "{body}"
+        );
+    }
+    assert_eq!(
+        listed(&h, &vm["id"]).await,
+        listed_vm(&json!([vm]), &vm["id"])
+    );
+}
+
+#[tokio::test]
+async fn the_owner_route_refuses_an_unknown_project() {
+    let h = harness().await;
+    let kept = project(&h, STAGE, "Payments").await;
+    let theirs = project(&h, PROD, "Payments").await;
+    let vm = lima_in(&h, Some(&kept)).await;
+    set_owner(&h, &vm, &json!({ "creator": "@bea:example.org" })).await;
+    for id in ["0".repeat(32), theirs, "nope".to_owned()] {
+        assert_eq!(
+            set_owner(&h, &vm, &json!({ "project_id": id })).await,
+            unknown_project(),
+            "{id}"
+        );
+        // All or nothing: the creator of the body does not change either.
+        let body = json!({ "project_id": id, "creator": "@cy:example.org" });
+        assert_eq!(set_owner(&h, &vm, &body).await, unknown_project(), "{id}");
+    }
+    let listed = listed(&h, &vm["id"]).await;
+    let fields = (&listed["creator"], &listed["project_id"]);
+    assert_eq!(fields, (&json!("@bea:example.org"), &json!(kept)));
+}
+
+#[tokio::test]
+async fn the_owner_route_needs_a_vm_of_the_tenant_with_a_row() {
+    let h = harness().await;
+    let vm = lima_in(&h, None).await;
+    let body = br#"{"creator":"@bea:example.org"}"#;
+    let id = vm["id"].as_str().unwrap();
+    for (auth, id) in [
+        (PROD, id),
+        (STAGE, "i-zz"),
+        (STAGE, "%FF"),
+        (STAGE, "i-0000000000000009"),
+    ] {
+        assert_eq!(
+            put_owner(&h, auth, id, body).await,
+            (StatusCode::NOT_FOUND, not_found()),
+            "{id}"
+        );
+    }
+    let legacy = "i-00000000aa";
+    h.fake
+        .seed(stage_vm(legacy, "old", "running", "t3a.medium"));
+    assert_eq!(
+        put_owner(&h, STAGE, legacy, body).await,
+        (
+            StatusCode::CONFLICT,
+            json!({ "error": "vm has no registry row" })
+        )
+    );
+    assert_eq!(listed(&h, &vm["id"]).await["creator"], Value::Null);
+}
+
+#[tokio::test]
+async fn a_project_delete_during_a_create_cannot_leave_a_dangling_vm() {
+    let h = harness().await;
+    h.fake.delay_launch(Duration::from_millis(30));
+    for n in 0..5 {
+        let id = project(&h, STAGE, &format!("p{n}")).await;
+        let body = with(|b| {
+            b["name"] = json!(format!("vm{n}"));
+            b["project_id"] = json!(id);
+        });
+        let uri = format!("/v1/projects/{id}");
+        let (vm, deleted) = tokio::join!(
+            create(&h.app, STAGE, &body),
+            call(&h.app, "DELETE", &uri, Some(STAGE))
+        );
+        match (vm.0, deleted.0) {
+            (StatusCode::CREATED, StatusCode::CONFLICT) => {
+                assert_eq!(deleted.1, json!({ "error": "project in use" }));
+                assert_eq!(vm.1["project_id"], id);
+            }
+            // The delete came during the launch: the new VM is personal.
+            (StatusCode::CREATED, StatusCode::NO_CONTENT) => {
+                assert_eq!(vm.1.get("project_id"), Some(&Value::Null), "{n}");
+            }
+            (StatusCode::BAD_REQUEST, StatusCode::NO_CONTENT) => {
+                assert_eq!(vm, unknown_project());
+            }
+            pair => panic!("{n}: {pair:?}"),
+        }
+        // Whatever the order, no registry row keeps the id of a deleted project.
+        if (vm.0, deleted.0) == (StatusCode::CREATED, StatusCode::NO_CONTENT) {
+            assert_eq!(row_project(&h, vm.1["id"].as_str().unwrap()).await, None);
+        }
+    }
+}
+
+/// Waits until the fake EC2 has accepted `n` launches in all. With `delay_launch`, the launch
+/// that made the last one is still running.
+async fn launched(h: &Harness, n: usize) {
+    for _ in 0..500 {
+        if h.fake.launches().len() >= n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!("no launch {n}");
+}
+
+async fn delete_project(h: &Harness, id: &str) -> (StatusCode, Vec<u8>) {
+    call_raw(&h.app, "DELETE", &format!("/v1/projects/{id}"), Some(STAGE)).await
+}
+
+#[tokio::test]
+async fn a_project_deleted_during_a_create_leaves_a_personal_vm() {
+    let h = harness().await;
+    let id = project(&h, STAGE, "Payments").await;
+    h.fake.delay_launch(Duration::from_millis(500));
+    let body = with(|b| {
+        b["project_id"] = json!(id);
+        b["creator"] = json!("@ann:example.org");
+    });
+    let app = h.app.clone();
+    let vm = tokio::spawn(async move { create(&app, STAGE, &body).await });
+    // The pre-check passed, and EC2 holds the launch: no registry row yet.
+    launched(&h, 1).await;
+    let deleted = (StatusCode::NO_CONTENT, Vec::new());
+    assert_eq!(delete_project(&h, &id).await, deleted);
+    let (status, vm) = vm.await.unwrap();
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    assert_eq!(vm.get("project_id"), Some(&Value::Null));
+    assert_eq!(vm["creator"], "@ann:example.org");
+    let listed = listed(&h, &vm["id"]).await;
+    let fields = (&listed["project_id"], &listed["creator"]);
+    assert_eq!(fields, (&Value::Null, &json!("@ann:example.org")));
+    assert_eq!(row_project(&h, vm["id"].as_str().unwrap()).await, None);
+    let (_, projects) = call(&h.app, "GET", "/v1/projects", Some(STAGE)).await;
+    assert_eq!(projects, json!([]));
+}
+
+#[tokio::test]
+async fn a_project_deleted_during_a_recreate_leaves_a_personal_vm() {
+    let h = harness().await;
+    let id = project(&h, STAGE, "Payments").await;
+    let body = with(|b| {
+        b["project_id"] = json!(id);
+        b["creator"] = json!("@ann:example.org");
+    });
+    let (status, old) = create(&h.app, STAGE, &body).await;
+    assert_eq!(status, StatusCode::CREATED);
+    h.fake.delay_launch(Duration::from_millis(500));
+    let app = h.app.clone();
+    let old_id = old["id"].as_str().unwrap().to_owned();
+    let new = tokio::spawn(async move {
+        let body = serde_json::to_vec(&recreate_body(json!(empty_payload()))).unwrap();
+        let uri = format!("/v1/vms/{old_id}/recreate");
+        let (status, bytes) = send(&app, "POST", &uri, Some(STAGE), body).await;
+        (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+    });
+    // The old row is gone, and EC2 holds the new launch: no row has the project.
+    launched(&h, 2).await;
+    let deleted = (StatusCode::NO_CONTENT, Vec::new());
+    assert_eq!(delete_project(&h, &id).await, deleted);
+    let (status, new) = new.await.unwrap();
+    assert_eq!(status, StatusCode::CREATED, "{new}");
+    assert_eq!(new.get("project_id"), Some(&Value::Null));
+    assert_eq!(new["creator"], "@ann:example.org");
+    assert_eq!(row_project(&h, new["id"].as_str().unwrap()).await, None);
+}
+
+#[tokio::test]
+async fn a_project_delete_does_not_wait_for_a_create_of_another_project() {
+    let h = harness().await;
+    let busy = project(&h, STAGE, "Busy").await;
+    let free = project(&h, STAGE, "Free").await;
+    let launch = Duration::from_secs(2);
+    h.fake.delay_launch(launch);
+    let body = with(|b| b["project_id"] = json!(busy));
+    let app = h.app.clone();
+    let vm = tokio::spawn(async move { create(&app, STAGE, &body).await });
+    launched(&h, 1).await;
+    let start = std::time::Instant::now();
+    let deleted = (StatusCode::NO_CONTENT, Vec::new());
+    assert_eq!(delete_project(&h, &free).await, deleted);
+    assert!(start.elapsed() < launch / 2, "{:?}", start.elapsed());
+    assert!(!vm.is_finished());
+    let (status, vm) = vm.await.unwrap();
+    assert_eq!(
+        (status, &vm["project_id"]),
+        (StatusCode::CREATED, &json!(busy))
+    );
 }
