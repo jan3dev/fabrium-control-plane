@@ -70,6 +70,14 @@ The database lives in the `data` Docker volume. It survives restarts.
 | `BIND_ADDR` | `127.0.0.1:8080` | `0.0.0.0:8080` | Set by the image. |
 | `DATABASE_URL` | `sqlite://data/control-plane.db` | `sqlite:///data/control-plane.db` | Set by the image. The service creates the file and its directory. |
 | `RUST_LOG` | `info` | from `.env` | Log filter. At `trace`, the AWS SDK logs whole requests, and the launch request holds the token of the new VM in its user data. Keep `info` in production. |
+| `GITHUB_APP_ID` | none (factory) | from `.env` | The GitHub App id of the agent factory. The factory variables are all or none: the service refuses to start when some are set and others are missing. |
+| `GITHUB_APP_PRIVATE_KEY` or `GITHUB_APP_PRIVATE_KEY_FILE` | none (factory) | `GITHUB_APP_PRIVATE_KEY_FILE=/run/secrets/github-app.pem` via `compose.factory.yaml` | The App private key. Inline PEM text in `GITHUB_APP_PRIVATE_KEY` (newlines written as `\n`), or a PEM file path in `GITHUB_APP_PRIVATE_KEY_FILE`. The Compose file mounts `./github-app.pem` read-only at the path that it sets. |
+| `GITHUB_WEBHOOK_SECRET` | none (factory) | from `.env` | The webhook secret of the App. `POST /v1/github/webhook` checks the signature with it. |
+| `FACTORY_REPOS` | none (factory) | from `.env` | Comma-separated `owner/name` entries. The service ignores webhooks for other repositories. The name check ignores case. |
+| `MATRIX_HOMESERVER` | none (factory) | from `.env` | The Matrix homeserver base URL. `http://` or `https://`. |
+| `MATRIX_ACCESS_TOKEN` | none (factory) | from `.env` | The access token of the bot account. |
+| `MATRIX_IMPLEMENTER` | none (factory) | from `.env` | The Matrix user id of the implementer. |
+| `MATRIX_REVIEWER` | none (factory) | from `.env` | The Matrix user id of the reviewer. |
 
 An empty value counts as not set. A `.env` file in the working directory is loaded automatically for local runs.
 
@@ -96,11 +104,11 @@ cargo run -p migration -- down
 cargo run -p migration -- status
 ```
 
-The CLI reads `DATABASE_URL`. The service runs the migrations at start. The database holds the VM registry (see [Auto-stop](#auto-stop)), the agent records (see [Agents](#agents)), and the projects (see [Projects](#projects)); in Docker it is in the named volume `data`, which survives a new image.
+The CLI reads `DATABASE_URL`. The service runs the migrations at start. The database holds the VM registry (see [Auto-stop](#auto-stop)), the agent records (see [Agents](#agents)), and the projects (see [Projects](#projects)); in Docker it is in the named volume `data`, which survives a new image. Migrations also create `github_deliveries` and `factory_runs` when the factory is used. Generate further entities later with `sea-orm-cli`.
 
 ## API
 
-Every route except `/health`, `/v1/bootstrap`, `/v1/vm/auto-stop`, and `/v1/vm/agents` needs `Authorization: Bearer <tenant API key>`. The server hashes the key with SHA-256 and compares it with the stored hashes. The scheme name is case-insensitive, and extra spaces before the key are ignored. A missing header, a wrong scheme, or an unknown key returns `401` with `WWW-Authenticate: Bearer` and `{"error":"missing or invalid API key"}`.
+Every route except `/health`, `/v1/bootstrap`, `/v1/vm/auto-stop`, `/v1/vm/agents`, and `/v1/github/webhook` needs `Authorization: Bearer <tenant API key>`. The server hashes the key with SHA-256 and compares it with the stored hashes. The scheme name is case-insensitive, and extra spaces before the key are ignored. A missing header, a wrong scheme, or an unknown key returns `401` with `WWW-Authenticate: Bearer` and `{"error":"missing or invalid API key"}`. The GitHub webhook uses `X-Hub-Signature-256` instead; see [docs/tech/agent-factory/listener.md](docs/tech/agent-factory/listener.md).
 
 A valid key also needs a source address. The address is the last `X-Forwarded-For` entry, which Caddy sets. Caddy is the only way in, so that entry is the real client (see [Deploy on the control host](#deploy-on-the-control-host)). An IPv4-mapped IPv6 address counts as its IPv4 address. The service checks the address against the `API_SOURCES` entries of the tenant of the key. A request from another address, or with no usable address, returns `403 {"error":"forbidden"}`, and the service logs a warning with the tenant and the address. The key check comes first, so a bad key always returns `401`.
 
@@ -129,6 +137,7 @@ A valid key also needs a source address. The address is the last `X-Forwarded-Fo
 | POST | `/v1/bootstrap` | `200 {"files":[...],"script":"..."}` | `404`, `502` |
 | GET | `/v1/vm/auto-stop` | `200 {"auto_stop_hours":N}` | `404` |
 | GET | `/v1/vm/agents` | `200 {"agents":[...]}` | `404` |
+| POST | `/v1/github/webhook` | `200 {"ok":true,…}` (GitHub App HMAC; no tenant key) | `403` bad signature, `404` if factory unset |
 
 Every error body is `{"error":"<short message>"}`. A `413` can have a plain-text body. Clients must branch on the status code, not on the message.
 
@@ -360,13 +369,13 @@ The `control` instance has 1.9 GiB of RAM, and the build of the image needs more
    cd fabrium-control-plane
    ```
 
-4. Create `.env` and set every variable of [Configuration](#configuration) that has no default: `API_KEYS`, `API_SOURCES`, `PUBLIC_URL`, `CP_HOST`, and the AWS credentials. `PUBLIC_URL` is `https://` plus `CP_HOST`. Set `API_SOURCES` to the public IP of the zooid host of each tenant before you deploy. A tenant whose zooid host is not in the list gets `403` on every call.
+4. Create `.env` and set every variable of [Configuration](#configuration) that has no default: `API_KEYS`, `API_SOURCES`, `PUBLIC_URL`, `CP_HOST`, and the AWS credentials. `PUBLIC_URL` is `https://` plus `CP_HOST`. Set `API_SOURCES` to the public IP of the zooid host of each tenant before you deploy. A tenant whose zooid host is not in the list gets `403` on every call. For the agent factory, set the factory variables too, and put the App key next to the Compose files as `github-app.pem`, readable by the container user: `chown 65532:65532 github-app.pem && chmod 400 github-app.pem`.
 
    ```sh
    cp .env.example .env
    ```
 
-5. Start the service and Caddy with the image that you loaded. `--no-build` keeps Compose from building on the host.
+5. Start the service and Caddy with the image that you loaded. `--no-build` keeps Compose from building on the host. With the agent factory, add `-f compose.factory.yaml` to the command.
 
    ```sh
    CP_TAG=<tag> docker compose -f compose.yaml -f compose.caddy.yaml up -d --no-build
@@ -380,9 +389,21 @@ The `control` instance has 1.9 GiB of RAM, and the build of the image needs more
 
 To update, build a new tag, load it on the host, and run step 5 with the new tag. If the Compose files changed, update the clone on the host first. From the version that added the source checks, `API_SOURCES` is required. Set it in `.env` before you update: without it the service refuses to start, so the container exits and `restart: unless-stopped` restarts it in a loop.
 
+Migrations run at startup and only go forward. SeaORM refuses to start when the database holds a migration that the image does not know, so a rollback needs a database from before the update. Back the database up before every update, and keep the file:
+
+```sh
+docker compose -f compose.yaml stop control-plane
+docker compose -f compose.yaml cp control-plane:/data/control-plane.db control-plane-$(date +%F).db
+docker compose -f compose.yaml start
+```
+
+To roll back, copy the file back into the stopped container and run step 5 with the old tag.
+
 `compose.caddy.yaml` adds the `caddy` service on the ports 80 and 443, with the named volumes `caddy_data` and `caddy_config`. The `Caddyfile` sends every request to `control-plane:8080`. Caddy sees only `CP_HOST`, not the AWS keys.
 
 Caddy must stay the only way in. The source checks trust the last `X-Forwarded-For` entry, and the `Caddyfile` sets that header to the address of the client (`header_up X-Forwarded-For {remote_host}`). The container binds `0.0.0.0:8080`. Compose publishes the port on the host loopback (`127.0.0.1`) only, and Caddy is the only other service on the Compose network. So only Caddy and the users of the host can reach the port, and the last entry is the real client. A client that reached the port directly could send any address. Do not publish the port on another interface, do not open it in the firewall, and do not add a service to the Compose network.
+
+`compose.factory.yaml` adds the agent factory to `control-plane`: it sets `GITHUB_APP_PRIVATE_KEY_FILE` and mounts `./github-app.pem` read-only at that path.
 
 ### Build memory
 
