@@ -311,6 +311,11 @@ pub fn transition(
                     return None;
                 }
             }
+            // A close of a different PR must not overwrite or block the run's PR
+            // (e.g. the implementer supersedes one PR with another).
+            if run.pr.is_some_and(|known| known != *pr) {
+                return None;
+            }
             run.pr = Some(*pr);
             if *merged {
                 run.state = RunState::Done;
@@ -556,5 +561,30 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::ArchiveTaskRoom { .. }))
         );
+    }
+
+    #[test]
+    fn close_of_other_pr_is_ignored() {
+        let (mut run, _) = transition(None, &ready(good_body()), 1_000).unwrap();
+        run.state = RunState::Review;
+        run.pr = Some(10);
+        let ev = FactoryEvent::PullRequestClosed {
+            repo: "acme/sandbox".into(),
+            branch: "factory/3".into(),
+            pr: 11,
+            merged: false,
+            issue: Some(3),
+        };
+        assert!(transition(Some(run.clone()), &ev, 2_000).is_none());
+        let merge = FactoryEvent::PullRequestClosed {
+            repo: "acme/sandbox".into(),
+            branch: "factory/3".into(),
+            pr: 10,
+            merged: true,
+            issue: Some(3),
+        };
+        let (next, _) = transition(Some(run), &merge, 2_000).unwrap();
+        assert_eq!(next.state, RunState::Done);
+        assert_eq!(next.pr, Some(10));
     }
 }

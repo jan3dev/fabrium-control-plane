@@ -1,8 +1,10 @@
 //! Load a run, run the pure transition, apply actions, persist.
 //!
-//! A state change is saved only after the wake-up it needs has succeeded. If an
-//! action fails, `handle` returns the error with the old row in place, so the
-//! same event delivered again repeats the step.
+//! A state change is saved only after the wake-up it needs has succeeded. If a
+//! wake fails, `handle` returns the error with the old row in place, so the
+//! same event delivered again repeats the step. Label updates are best-effort:
+//! once the wake has saved the new state, a label failure must not release the
+//! delivery and leave a redelivery that finds the row and does nothing.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -114,14 +116,17 @@ pub async fn handle(
                     .context("FinishReview")?;
             }
             Action::SetStateLabel { repo, issue, state } => {
-                actions::set_state_label(&rt, &repo, issue, state)
-                    .await
-                    .context("SetStateLabel")?;
+                // Best-effort: the run is already saved after the wake. A label
+                // failure must not release the delivery and leave a stuck ready
+                // label that a redelivery ignores because the row exists.
+                if let Err(e) = actions::set_state_label(&rt, &repo, issue, state).await {
+                    tracing::warn!(%repo, issue, error = %format!("{e:#}"), "SetStateLabel failed");
+                }
             }
             Action::RemoveReadyLabel { repo, issue } => {
-                actions::remove_ready_label(&rt, &repo, issue)
-                    .await
-                    .context("RemoveReadyLabel")?;
+                if let Err(e) = actions::remove_ready_label(&rt, &repo, issue).await {
+                    tracing::warn!(%repo, issue, error = %format!("{e:#}"), "RemoveReadyLabel failed");
+                }
             }
             Action::Comment { repo, issue, body } => {
                 actions::comment(&rt, &repo, issue, &body)

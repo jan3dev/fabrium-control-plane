@@ -85,6 +85,8 @@ struct CheckSuite {
     conclusion: Option<String>,
     head_branch: Option<String>,
     head_sha: Option<String>,
+    /// The repository that owns the head commit. A fork's suite names the fork.
+    head_repository: Option<RepoFull>,
     /// Present on completed suites; unused beyond logging for now.
     #[allow(dead_code)]
     status: Option<String>,
@@ -109,6 +111,8 @@ struct PullRequest {
 struct PrHead {
     #[serde(rename = "ref")]
     branch: String,
+    /// Absent when the head repo was deleted. A fork PR names the fork.
+    repo: Option<RepoFull>,
 }
 
 /// Turn a GitHub webhook `X-GitHub-Event` + JSON body into zero or one factory event.
@@ -157,6 +161,11 @@ fn normalize_check_suite(body: &Value) -> Option<FactoryEvent> {
     if !branch.starts_with("factory/") {
         return None;
     }
+    // A fork suite whose head branch is `factory/N` must not drive the run.
+    let head_repo = p.check_suite.head_repository.as_ref()?;
+    if !same_repo(&head_repo.full_name, &p.repository.full_name) {
+        return None;
+    }
     let conclusion = p.check_suite.conclusion.unwrap_or_else(|| "neutral".into());
     let all_green = is_passing(&conclusion);
     Some(FactoryEvent::CheckSuite {
@@ -166,6 +175,10 @@ fn normalize_check_suite(body: &Value) -> Option<FactoryEvent> {
         conclusion,
         all_green,
     })
+}
+
+fn same_repo(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
 }
 
 /// GitHub counts a skipped or neutral required check as passing.
@@ -227,6 +240,11 @@ fn normalize_pull_request(body: &Value) -> Option<FactoryEvent> {
     }
     let branch = p.pull_request.head.branch;
     if !branch.starts_with("factory/") {
+        return None;
+    }
+    // A fork PR whose head ref is `factory/N` must not block or finish the run.
+    let head_repo = p.pull_request.head.repo.as_ref()?;
+    if !same_repo(&head_repo.full_name, &p.repository.full_name) {
         return None;
     }
     let issue = branch
@@ -332,6 +350,7 @@ mod tests {
                 "conclusion": "failure",
                 "head_branch": "factory/3",
                 "head_sha": "abc123",
+                "head_repository": {"full_name": "acme/sandbox"},
                 "status": "completed"
             },
             "repository": {"full_name": "acme/sandbox"}
@@ -361,6 +380,7 @@ mod tests {
                 "conclusion": "skipped",
                 "head_branch": "factory/3",
                 "head_sha": "abc123",
+                "head_repository": {"full_name": "acme/sandbox"},
                 "status": "completed"
             },
             "repository": {"full_name": "acme/sandbox"}
@@ -372,6 +392,22 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn fork_check_suite_is_ignored() {
+        let body = json!({
+            "action": "completed",
+            "check_suite": {
+                "conclusion": "success",
+                "head_branch": "factory/3",
+                "head_sha": "abc123",
+                "head_repository": {"full_name": "attacker/sandbox"},
+                "status": "completed"
+            },
+            "repository": {"full_name": "acme/sandbox"}
+        });
+        assert!(normalize("check_suite", &body).is_none());
     }
 
     fn suite_list(suites: &[(&str, Option<&str>, u64)]) -> Value {
@@ -440,6 +476,7 @@ mod tests {
             "check_suite": {
                 "conclusion": "success",
                 "head_branch": "factory/3",
+                "head_repository": {"full_name": "acme/sandbox"},
                 "status": "completed"
             },
             "repository": {"full_name": "acme/sandbox"}
@@ -454,7 +491,7 @@ mod tests {
             "pull_request": {
                 "number": 9,
                 "merged": true,
-                "head": {"ref": "factory/4"},
+                "head": {"ref": "factory/4", "repo": {"full_name": "acme/sandbox"}},
                 "body": "Fixes the thing"
             },
             "repository": {"full_name": "acme/sandbox"}
@@ -468,5 +505,20 @@ mod tests {
             } => {}
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn fork_pr_close_is_ignored() {
+        let body = json!({
+            "action": "closed",
+            "pull_request": {
+                "number": 99,
+                "merged": false,
+                "head": {"ref": "factory/3", "repo": {"full_name": "attacker/sandbox"}},
+                "body": ""
+            },
+            "repository": {"full_name": "acme/sandbox"}
+        });
+        assert!(normalize("pull_request", &body).is_none());
     }
 }

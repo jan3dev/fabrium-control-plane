@@ -53,6 +53,7 @@ fn factory_config(repos: &str) -> FactoryConfig {
 async fn harness(repos: &str) -> Router {
     let config = Config::from_lookup(|k| match k {
         "API_KEYS" => Some(format!("stage:{STAGE_HASH}")),
+        "API_SOURCES" => Some("stage:192.0.2.0/24".to_owned()),
         "PUBLIC_URL" => Some("https://cp.example.org".to_owned()),
         _ => None,
     })
@@ -61,6 +62,7 @@ async fn harness(repos: &str) -> Router {
     let state = AppState::new(
         db::connect("sqlite::memory:").await.unwrap(),
         config.api_keys,
+        config.api_sources,
         config.vm,
         Arc::new(FakeEc2::default()),
     )
@@ -160,6 +162,7 @@ async fn ignored_repository_is_ok() {
 async fn webhook_without_factory_is_404() {
     let config = Config::from_lookup(|k| match k {
         "API_KEYS" => Some(format!("stage:{STAGE_HASH}")),
+        "API_SOURCES" => Some("stage:192.0.2.0/24".to_owned()),
         "PUBLIC_URL" => Some("https://cp.example.org".to_owned()),
         _ => None,
     })
@@ -167,6 +170,7 @@ async fn webhook_without_factory_is_404() {
     let state = AppState::new(
         db::connect("sqlite::memory:").await.unwrap(),
         config.api_keys,
+        config.api_sources,
         config.vm,
         Arc::new(FakeEc2::default()),
     );

@@ -299,6 +299,7 @@ async fn failed_dispatch_releases_delivery_for_redelivery() {
     let (base, stub) = start_stub().await;
     let config = Config::from_lookup(|k| match k {
         "API_KEYS" => Some(format!("stage:{STAGE_HASH}")),
+        "API_SOURCES" => Some("stage:192.0.2.0/24".to_owned()),
         "PUBLIC_URL" => Some("https://cp.example.org".to_owned()),
         _ => None,
     })
@@ -310,6 +311,7 @@ async fn failed_dispatch_releases_delivery_for_redelivery() {
     let state = AppState::new(
         db.clone(),
         config.api_keys,
+        config.api_sources,
         config.vm,
         Arc::new(FakeEc2::default()),
     )
@@ -322,6 +324,7 @@ async fn failed_dispatch_releases_delivery_for_redelivery() {
             "conclusion": "success",
             "head_branch": "factory/3",
             "head_sha": SHA,
+            "head_repository": {"full_name": "acme/sandbox"},
             "status": "completed"
         },
         "repository": {"full_name": "acme/sandbox"}
