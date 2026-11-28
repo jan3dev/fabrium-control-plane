@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref, e.g. rapid pushes to a PR.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Without debug info the test build with aws-sdk-ec2 is several GB smaller and links faster.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same toolchain as the build stage of the Dockerfile.
+      - name: Install Rust 1.99.1
+        run: rustup toolchain install 1.99.1 --profile minimal && rustup default 1.99.1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
